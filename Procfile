@@ -1,1 +1,1 @@
-web: PYTHONPATH=/app alembic upgrade head && PYTHONPATH=/app uvicorn apps.api.main:app --host 0.0.0.0 --port ${PORT:-8000}
+web: PYTHONPATH=/app alembic upgrade head && PYTHONPATH=/app python -m bot.main
