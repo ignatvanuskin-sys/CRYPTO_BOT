@@ -1,4 +1,8 @@
 import asyncio
+import os
+import sys
+# Ensure project root (/app) is on PYTHONPATH for `import db` when alembic runs in container
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from logging.config import fileConfig
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection

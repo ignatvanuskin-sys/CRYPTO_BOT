@@ -1,1 +1,1 @@
-web: alembic upgrade head && python -m bot.main
+web: PYTHONPATH=/app alembic upgrade head && PYTHONPATH=/app python -m bot.main
