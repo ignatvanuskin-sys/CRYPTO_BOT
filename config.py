@@ -5,8 +5,12 @@ from pydantic import Field
 class Settings(BaseSettings):
     bot_token: str = Field(default="", alias="BOT_TOKEN")
     database_url: str = Field(default="sqlite+aiosqlite:///./tradeweek.db", alias="DATABASE_URL")
+    trading_mode: str = Field(default="paper", alias="TRADING_MODE")
+    initial_balance_usd: str = Field(default="10000", alias="INITIAL_BALANCE_USD")
     weekly_grant_amount: str = Field(default="10000", alias="WEEKLY_GRANT_AMOUNT")
     prize_top_n: int = Field(default=10, alias="PRIZE_TOP_N")
+    paper_slippage_bps: int = Field(default=5, alias="PAPER_SLIPPAGE_BPS")
+    webapp_url: str = Field(default="", alias="WEBAPP_URL")
     max_price_staleness_seconds: int = Field(default=3, alias="MAX_PRICE_STALENESS_SECONDS")
     price_poll_interval_seconds: int = Field(default=2, alias="PRICE_POLL_INTERVAL_SECONDS")
     min_24h_quote_volume_usdt: str = Field(default="1000000", alias="MIN_24H_QUOTE_VOLUME_USDT")
