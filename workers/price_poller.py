@@ -101,10 +101,11 @@ async def poll_prices(engine, price_cache):
 
 async def main():
     from services.pricing import price_cache
-    engine = create_async_engine(settings.database_url, echo=False)
+    engine = create_async_engine(settings.database_url_async, echo=False)
     await sync_assets(engine)
     await poll_prices(engine, price_cache)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
+

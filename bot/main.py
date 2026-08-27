@@ -10,7 +10,7 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     if not settings.bot_token:
         raise RuntimeError("BOT_TOKEN not set")
-    engine = create_async_engine(settings.database_url, echo=False)
+    engine = create_async_engine(settings.database_url_async, echo=False)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     bot = Bot(token=settings.bot_token)
@@ -29,3 +29,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

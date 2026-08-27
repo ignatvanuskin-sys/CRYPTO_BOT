@@ -13,7 +13,7 @@ from decimal import Decimal
 logger = logging.getLogger(__name__)
 
 async def run_weekly_close():
-    engine = create_async_engine(settings.database_url, echo=False)
+    engine = create_async_engine(settings.database_url_async, echo=False)
     async with async_sessionmaker(engine, expire_on_commit=False)() as session:
         async with session.begin():
             week = await get_or_create_active_week(session)
@@ -43,3 +43,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
