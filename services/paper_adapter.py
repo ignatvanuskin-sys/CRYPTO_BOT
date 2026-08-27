@@ -5,7 +5,9 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from db.paper_models import TradingAccount, Instrument, PaperPosition, PaperOrder, AccountLedger, PositionStatus, OrderStatus, LedgerType
+from db.competition_models import Execution, ExecutionReason
 from services.pricing import price_cache, PriceStale, PriceNotAvailable
+from services.bingx_market_data import get_snapshot, is_stale, MarketDataUnavailable, MarketDataStale
 from services.pnl import calc_pnl, calc_unrealized, calc_notional
 from config import settings
 
@@ -45,26 +47,35 @@ async def open_position(
     account: TradingAccount,
     symbol: str,
     side: str,  # LONG/SHORT
-    quantity: Decimal,
+    quantity: Decimal | None = None,
     take_profit: Decimal | None = None,
     stop_loss: Decimal | None = None,
     idempotency_key: str = "",
+    notional: Decimal | None = None,
+    competition_id: int | None = None,
+    requested_at: datetime | None = None,
 ) -> PaperPosition:
     # idempotency
     if idempotency_key:
         existing = await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))
         if existing.scalar_one_or_none():
-            # return associated position
             order = (await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))).scalar_one()
             if order.position_id:
                 pos = await session.get(PaperPosition, order.position_id)
                 return pos
             raise PaperError("Duplicate order but no position")
 
-    # validation
-    quantity = Decimal(str(quantity)).quantize(QTY_Q)
-    if quantity <= 0:
-        raise InvalidQuantity("Quantity must be >0")
+    # competitions: resolve active if not given
+    if competition_id is None:
+        from db.competition_models import Competition, CompetitionStatus
+        res = await session.execute(select(Competition).where(Competition.status == CompetitionStatus.ACTIVE.value).order_by(Competition.id.desc()).limit(1))
+        comp = res.scalar_one_or_none()
+        if comp:
+            competition_id = comp.id
+
+    if requested_at is None:
+        requested_at = datetime.now(timezone.utc)
+
     side = side.upper()
     if side not in ("LONG", "SHORT"):
         raise PaperError("Side must be LONG/SHORT")
@@ -72,35 +83,67 @@ async def open_position(
     # instrument
     inst = await session.get(Instrument, symbol)
     if not inst or inst.status != "active":
-        raise InvalidSymbol(f"Unknown symbol {symbol}")
+        # try dash variant
+        alt = symbol.replace("-", "")
+        inst = await session.get(Instrument, alt)
+        if not inst or inst.status != "active":
+            raise InvalidSymbol(f"Unknown symbol {symbol}")
+
+    # price from backend bid/ask — canonical BINGX perpetual
+    snap = get_snapshot(symbol)
+    if snap is None:
+        # fallback to legacy price_cache
+        try:
+            price, ts = price_cache.get_price_or_raise(symbol)
+            # synthesize bid/ask from last
+            snap_bid = snap_ask = price
+            snap_ts = ts
+        except:
+            raise PaperError("Market data unavailable")
+    else:
+        max_age = settings.market_data_max_age_ms
+        if is_stale(snap, max_age):
+            raise PaperError("Market data stale")
+        if snap.bid is None or snap.ask is None:
+            raise PaperError("Market data unavailable (no bid/ask)")
+        snap_bid, snap_ask = snap.bid, snap.ask
+        snap_ts = snap.exchange_timestamp or snap.received_at
+
+    # LONG OPEN = ASK, SHORT OPEN = BID (spec 5)
+    if side == "LONG":
+        raw_price = snap_ask if snap and snap.ask else snap_bid
+    else:
+        raw_price = snap_bid if snap and snap.bid else snap_ask
+    if raw_price is None:
+        raise PaperError("Market data unavailable")
+
+    # slippage (0 for demo)
+    slippage = Decimal(settings.paper_slippage_bps) / Decimal("10000")
+    if slippage > 0:
+        if side == "LONG":
+            executed_price = (raw_price * (Decimal("1") + slippage)).quantize(PRICE_Q)
+        else:
+            executed_price = (raw_price * (Decimal("1") - slippage)).quantize(PRICE_Q)
+    else:
+        executed_price = raw_price.quantize(PRICE_Q)
+
+    # quantity from notional if provided (new TASK: frontend sends notional)
+    if notional is not None:
+        notional_dec = Decimal(str(notional))
+        if notional_dec <= 0:
+            raise InvalidQuantity("Notional must be >0")
+        quantity = (notional_dec / executed_price).quantize(QTY_Q)
+    elif quantity is not None:
+        quantity = Decimal(str(quantity)).quantize(QTY_Q)
+        if quantity <= 0:
+            raise InvalidQuantity("Quantity must be >0")
+    else:
+        raise InvalidQuantity("Quantity or notional required")
+
     if inst.min_quantity and quantity < inst.min_quantity:
         raise InvalidQuantity(f"Quantity < min {inst.min_quantity}")
     if inst.max_quantity and quantity > inst.max_quantity:
         raise InvalidQuantity(f"Quantity > max {inst.max_quantity}")
-
-    # price from backend, not frontend
-    try:
-        # instruments use BTCUSDT format, price_cache uses BTC-USDT or BTCUSDT? normalize
-        # try both
-        price, ts = price_cache.get_price_or_raise(symbol)
-    except (PriceStale, PriceNotAvailable):
-        # try dash variant
-        dash = symbol.replace("USDT", "-USDT").replace("--", "-")
-        # fallback try without dash logic
-        for cand in [symbol, symbol.replace("USDT", "-USDT"), symbol.replace("-", "")]:
-            try:
-                price, ts = price_cache.get_price_or_raise(cand)
-                break
-            except:
-                continue
-        else:
-            raise PaperError("Market data unavailable")
-    # slippage
-    slippage = Decimal(settings.paper_slippage_bps) / Decimal("10000")
-    if side == "LONG":
-        executed_price = (price * (Decimal("1") + slippage)).quantize(PRICE_Q)
-    else:
-        executed_price = (price * (Decimal("1") - slippage)).quantize(PRICE_Q)
 
     _validate_tp_sl(side, executed_price, take_profit, stop_loss)
 
@@ -112,7 +155,6 @@ async def open_position(
     notional = calc_notional(executed_price, quantity)
     # margin check: required = notional (no leverage)
     if notional > account.available_margin:
-        # create rejected order
         order = PaperOrder(
             account_id=account.id,
             symbol=symbol,
@@ -122,19 +164,19 @@ async def open_position(
             status=OrderStatus.REJECTED.value,
             idempotency_key=idempotency_key or f"rej-{datetime.now(timezone.utc).timestamp()}",
             rejection_reason="Insufficient margin",
-            requested_price=price,
+            requested_price=raw_price,
         )
         session.add(order)
         await session.flush()
         raise InsufficientMargin(f"Need {notional}, available {account.available_margin}")
 
-    # create order + position
+    # create order + position (with competition_id)
     order = PaperOrder(
         account_id=account.id,
         symbol=symbol,
         side=side,
         quantity=quantity,
-        requested_price=price,
+        requested_price=raw_price,
         executed_price=executed_price,
         status=OrderStatus.FILLED.value,
         idempotency_key=idempotency_key,
@@ -145,6 +187,7 @@ async def open_position(
 
     position = PaperPosition(
         account_id=account.id,
+        competition_id=competition_id,
         symbol=symbol,
         side=side,
         status=PositionStatus.OPEN.value,
@@ -160,6 +203,42 @@ async def open_position(
     session.add(position)
     await session.flush()
     order.position_id = position.id
+    await session.flush()
+
+    # immutable execution record (spec 7)
+    # need user_id and competition_id for execution
+    # get user_id via account
+    from db.models import User as LegacyUser
+    # account.user_id is the user
+    user_id = account.user_id
+    if competition_id is None:
+        # fallback: try to find participant's competition
+        from db.competition_models import CompetitionParticipant
+        res = await session.execute(select(CompetitionParticipant).where(CompetitionParticipant.user_id == user_id).order_by(CompetitionParticipant.joined_at.desc()).limit(1))
+        part = res.scalar_one_or_none()
+        if part:
+            competition_id = part.competition_id
+    if competition_id is not None:
+        execution = Execution(
+            position_id=position.id,
+            user_id=user_id,
+            competition_id=competition_id,
+            symbol=symbol,
+            side=side,
+            price_source="BINGX",
+            market_type="USD_M_PERPETUAL",
+            bid_price=snap_bid,
+            ask_price=snap_ask,
+            execution_price=executed_price,
+            quantity=quantity,
+            notional=notional,
+            market_timestamp=snap_ts,
+            requested_at=requested_at,
+            executed_at=datetime.now(timezone.utc),
+            execution_reason=ExecutionReason.OPEN.value,
+        )
+        session.add(execution)
+        await session.flush()
 
     # ledger TRADE_OPEN: deduct notional? For paper, margin_used increases, cash decreases? Spec: balance vs equity.
     # Simplistic: cash_balance -= notional, margin_used += notional
@@ -207,19 +286,34 @@ async def close_position(
         if existing.scalar_one_or_none():
             return position, position.realized_pnl
 
-    # get current price
-    try:
-        price, _ = price_cache.get_price_or_raise(position.symbol)
-    except:
-        # try dash variant
-        for cand in [position.symbol, position.symbol.replace("USDT", "-USDT")]:
-            try:
-                price, _ = price_cache.get_price_or_raise(cand)
-                break
-            except:
-                continue
-        else:
+    # get current price via bid/ask (spec 5: LONG CLOSE=BID, SHORT CLOSE=ASK)
+    snap = get_snapshot(position.symbol)
+    if snap is None:
+        try:
+            # fallback to legacy cache as synthesized bid/ask
+            price, ts = price_cache.get_price_or_raise(position.symbol)
+            snap_bid = snap_ask = price
+            snap_ts = ts
+        except:
             raise PaperError("Market data unavailable")
+    else:
+        max_age = settings.market_data_max_age_ms
+        if is_stale(snap, max_age):
+            raise PaperError("Market data stale")
+        if snap.bid is None or snap.ask is None:
+            raise PaperError("Market data unavailable (no bid/ask)")
+        snap_bid, snap_ask = snap.bid, snap.ask
+        snap_ts = snap.exchange_timestamp or snap.received_at
+
+    # choose close price per side
+    if position.side == "LONG":
+        close_price = snap_bid if snap and snap.bid else snap_ask
+    else:
+        close_price = snap_ask if snap and snap.ask else snap_bid
+    if close_price is None:
+        raise PaperError("Market data unavailable")
+    close_price = close_price.quantize(PRICE_Q)
+    requested_at_close = datetime.now(timezone.utc)
 
     await _lock_account(session, account.id)
     await session.refresh(account)
@@ -228,7 +322,7 @@ async def close_position(
         raise PaperError("Position already closed")
 
     # calc pnl
-    gross = calc_pnl(position.side, position.entry_price, price, position.quantity)
+    gross = calc_pnl(position.side, position.entry_price, close_price, position.quantity)
     net = gross - position.fee_open - position.fee_close
 
     # create close order
@@ -238,8 +332,8 @@ async def close_position(
         symbol=position.symbol,
         side=position.side,
         quantity=position.quantity,
-        requested_price=price,
-        executed_price=price,
+        requested_price=close_price,
+        executed_price=close_price,
         status=OrderStatus.FILLED.value,
         reduce_only=True,
         idempotency_key=idempotency_key or f"close:{position.id}:{datetime.now(timezone.utc).timestamp()}",
@@ -250,11 +344,45 @@ async def close_position(
 
     # update position
     position.status = PositionStatus.CLOSED.value
-    position.current_price = price
+    position.current_price = close_price
     position.realized_pnl = net
     position.unrealized_pnl = Decimal("0")
     position.closed_at = datetime.now(timezone.utc)
     position.updated_at = datetime.now(timezone.utc)
+
+    # immutable execution for close
+    # map reason to ExecutionReason
+    reason_map = {"manual": ExecutionReason.MANUAL_CLOSE.value, "TP": ExecutionReason.TAKE_PROFIT.value, "SL": ExecutionReason.STOP_LOSS.value}
+    exec_reason = reason_map.get(reason, ExecutionReason.MANUAL_CLOSE.value)
+    # competition_id from position or active
+    comp_id = getattr(position, 'competition_id', None)
+    if comp_id is None:
+        from db.competition_models import CompetitionParticipant
+        res = await session.execute(select(CompetitionParticipant).where(CompetitionParticipant.user_id == account.user_id).order_by(CompetitionParticipant.joined_at.desc()).limit(1))
+        part = res.scalar_one_or_none()
+        if part:
+            comp_id = part.competition_id
+    if comp_id is not None:
+        execution = Execution(
+            position_id=position.id,
+            user_id=account.user_id,
+            competition_id=comp_id,
+            symbol=position.symbol,
+            side=position.side,
+            price_source="BINGX",
+            market_type="USD_M_PERPETUAL",
+            bid_price=snap_bid,
+            ask_price=snap_ask,
+            execution_price=close_price,
+            quantity=position.quantity,
+            notional=calc_notional(close_price, position.quantity),
+            market_timestamp=snap_ts,
+            requested_at=requested_at_close,
+            executed_at=datetime.now(timezone.utc),
+            execution_reason=exec_reason,
+        )
+        session.add(execution)
+        await session.flush()
 
     # ledger: return notional + pnl
     # cash was deducted at open by notional, now we return notional + pnl

@@ -114,6 +114,7 @@ class PaperPosition(Base):
     __tablename__ = "paper_positions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[int] = mapped_column(Integer, ForeignKey("trading_accounts.id"), nullable=False)
+    competition_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("competitions.id"), nullable=True)
     symbol: Mapped[str] = mapped_column(String(20), ForeignKey("instruments.symbol"), nullable=False)
     side: Mapped[str] = mapped_column(SAEnum(PositionSide, name="paper_position_side"), nullable=False)
     status: Mapped[str] = mapped_column(SAEnum(PositionStatus, name="paper_position_status"), default=PositionStatus.OPEN.value, nullable=False)
@@ -134,6 +135,7 @@ class PaperPosition(Base):
         CheckConstraint("quantity > 0", name="ck_paper_position_qty_positive"),
         Index("ix_paper_positions_account_status", "account_id", "status"),
         Index("ix_paper_positions_symbol", "symbol"),
+        Index("ix_pp_competition", "competition_id"),
     )
 
 class AuditLog(Base):

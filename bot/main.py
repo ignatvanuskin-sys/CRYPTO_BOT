@@ -5,6 +5,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from config import settings
 from bot.handlers.user import router as user_router
 from bot.handlers.admin import router as admin_router
+from bot.handlers.trade import router as trade_router
+from bot.handlers.leaderboard import router as leaderboard_router
+from bot.handlers.profile import router as profile_router
 
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -22,6 +25,9 @@ async def main():
             data["session"] = session
             return await handler(event, data)
 
+    dp.include_router(profile_router)  # /start new (paper) — must be first
+    dp.include_router(trade_router)
+    dp.include_router(leaderboard_router)
     dp.include_router(user_router)
     dp.include_router(admin_router)
 

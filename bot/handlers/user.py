@@ -15,6 +15,10 @@ router = Router()
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, session: AsyncSession):
+    from config import settings as _cfg
+    if _cfg.trading_mode == "paper":
+        # new Trading Game handles /start via profile router; keep legacy silent
+        return
     user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
     await session.commit()
     from bot.keyboards import contact_keyboard, rules_keyboard

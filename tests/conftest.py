@@ -4,6 +4,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from db.base import Base
 import db.paper_models  # ensure new tables are registered for create_all
+import db.competition_models  # competitions, participants, executions
 from datetime import datetime, timezone
 from decimal import Decimal
 

@@ -16,8 +16,10 @@ last_alert_at: datetime | None = None
 ALERT_THRESHOLD = 5  # после N подряд ошибок — алерт админу (в проде — Telegram/лог)
 
 async def sync_assets(engine):
-    """Fetch all spot symbols from BingX via ccxt and upsert into assets."""
-    exchange = ccxt.bingx({'enableRateLimit': True})
+    """Fetch all symbols from BingX via ccxt and upsert into assets + instruments.
+    Supports spot (legacy TradeWeek) and swap perpetual (new Trading Game)."""
+    exchange = ccxt.bingx({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+    swap_exchange = ccxt.bingx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
     try:
         await exchange.load_markets()
         for symbol, market in exchange.markets.items():
@@ -38,16 +40,44 @@ async def sync_assets(engine):
                         asset.status = 'active'
                         asset.updated_at = datetime.now(timezone.utc)
                     await session.commit()
+        # swap perpetual for new game -> instruments
+        try:
+            await swap_exchange.load_markets()
+            from db.paper_models import Instrument
+            for symbol, market in swap_exchange.markets.items():
+                if market.get('swap') and market.get('active'):
+                    # e.g. BTC/USDT, keep as BTCUSDT for instruments
+                    inst_symbol = symbol.replace("/", "").replace(":", "")
+                    # keep USDT perpetual only
+                    if not inst_symbol.endswith("USDT"):
+                        continue
+                    base = market.get('base', '')
+                    quote = market.get('quote', '')
+                    async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+                        inst = await session.get(Instrument, inst_symbol)
+                        if inst is None:
+                            inst = Instrument(symbol=inst_symbol, base_asset=base, quote_asset=quote, status='active', price_precision=2, quantity_precision=6, min_quantity=Decimal("0.000001"), created_at=datetime.now(timezone.utc))
+                            session.add(inst)
+                        else:
+                            inst.base_asset = base
+                            inst.quote_asset = quote
+                            inst.status = 'active'
+                        await session.commit()
+        except Exception as e:
+            logger.warning(f"swap sync failed: {e}")
         logger.info("Assets sync complete")
     finally:
         await exchange.close()
+        try:
+            await swap_exchange.close()
+        except:
+            pass
 
 async def fetch_once(exchange, engine, price_cache):
     """
     Один батч fetch_tickers с retry/backoff.
+    Обновляет legacy price_cache (last) + новый bingx snapshots (bid/ask) + volume.
     Возвращает True при успехе, False при ошибке.
-    При ошибке — не падает, инкрементит consecutive_failures, логирует.
-    Цены не обновляются, поэтому быстро протухают и ордера отклоняются (MAX_PRICE_STALENESS_SECONDS).
     """
     global consecutive_failures, last_alert_at
     max_retries = 3
@@ -56,11 +86,34 @@ async def fetch_once(exchange, engine, price_cache):
         try:
             tickers = await exchange.fetch_tickers()
             now = datetime.now(timezone.utc)
+            from services.bingx_market_data import PriceSnapshot, update_snapshot
             for sym, ticker in tickers.items():
                 db_sym = sym.replace("/", "-")
                 price = ticker.get('last') or ticker.get('close')
                 if price is not None:
                     price_cache.update(db_sym, Decimal(str(price)), now)
+                # also update bingx perpetual snapshot with bid/ask
+                bid = ticker.get('bid')
+                ask = ticker.get('ask')
+                ts = ticker.get('timestamp')
+                exchange_ts = datetime.fromtimestamp(ts/1000, tz=timezone.utc) if ts else now
+                # normalize symbol for instruments (BTCUSDT)
+                inst_sym = sym.replace("/", "").replace(":", "")
+                snap = PriceSnapshot(
+                    symbol=sym,
+                    bid=Decimal(str(bid)) if bid is not None else None,
+                    ask=Decimal(str(ask)) if ask is not None else None,
+                    last=Decimal(str(price)) if price is not None else None,
+                    exchange_timestamp=exchange_ts,
+                    received_at=now,
+                )
+                update_snapshot(snap)
+                # also store dash variant for legacy
+                alt = inst_sym
+                if alt:
+                    # store under both forms
+                    snap2 = PriceSnapshot(symbol=alt, bid=snap.bid, ask=snap.ask, last=snap.last, exchange_timestamp=exchange_ts, received_at=now)
+                    update_snapshot(snap2)
                 vol = ticker.get('quoteVolume')
                 if vol is not None:
                     async with async_sessionmaker(engine, expire_on_commit=False)() as session:
