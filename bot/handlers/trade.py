@@ -83,29 +83,38 @@ def safe_trade_error(exc: Exception) -> str:
 def trade_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Выбрать монету", callback_data="trade:coin", icon_custom_emoji_id=DIAMOND_ID)],
-            [InlineKeyboardButton(text="Быстрое открытие", callback_data="trade:quick", icon_custom_emoji_id=BOOM_ID)],
+            [InlineKeyboardButton(text="1. Выбрать монету", callback_data="trade:coin", icon_custom_emoji_id=DIAMOND_ID)],
+            [InlineKeyboardButton(text="2. Быстрое открытие", callback_data="trade:quick", icon_custom_emoji_id=BOOM_ID)],
         ]
     )
 
 
-def leverage_keyboard(symbol: str, budget: str) -> InlineKeyboardMarkup:
-    # Split into two rows for readability (Telegram max 8 per row)
+def leverage_keyboard(symbol: str, budget: str, max_leverage: int | None = None) -> InlineKeyboardMarkup:
+    # Filter by max_leverage for this symbol (BingX per-coin tier)
+    allowed = LEVERAGES
+    if max_leverage is not None:
+        try:
+            ml = int(max_leverage)
+            allowed = [lv for lv in LEVERAGES if int(lv) <= ml]
+            if not allowed:
+                allowed = ["1"]
+        except Exception:
+            pass
     row1 = [
         InlineKeyboardButton(text=f"{lev}x", callback_data=f"lev:{symbol}:{budget}:{lev}", icon_custom_emoji_id=GEAR_ID)
-        for lev in LEVERAGES[:5]
+        for lev in allowed[:5]
     ]
     row2 = [
         InlineKeyboardButton(text=f"{lev}x", callback_data=f"lev:{symbol}:{budget}:{lev}", icon_custom_emoji_id=GEAR_ID)
-        for lev in LEVERAGES[5:]
+        for lev in allowed[5:]
     ]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            row1,
-            row2,
-            [InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)],
-        ]
-    )
+    rows = []
+    if row1:
+        rows.append(row1)
+    if row2:
+        rows.append(row2)
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def side_keyboard(symbol: str, budget: str, leverage: str) -> InlineKeyboardMarkup:
@@ -147,7 +156,7 @@ def normalize_ticker(raw: str) -> str | None:
         return None
     if not value.endswith("USDT"):
         value += "USDT"
-    if len(value) > 20:
+    if len(value) > 40:
         return None
     return value
 
@@ -277,13 +286,20 @@ async def handle_trade_text(message: Message, session):
 
     # --- Шаг: бюджет ---
     if step == "budget":
+        raw = (message.text or "").strip()
+        if len(raw) > 20:
+            await message.answer(f"{TG_WARNING} Слишком длинный ввод.", parse_mode=ParseMode.HTML)
+            return
         try:
-            budget = Decimal((message.text or "").strip().replace(",", "."))
+            budget = Decimal(raw.replace(",", "."))
         except (InvalidOperation, ValueError):
             await message.answer(f"{TG_WARNING} Введите число, например: 100", parse_mode=ParseMode.HTML)
             return
         if not budget.is_finite() or budget <= 0:
             await message.answer(f"{TG_WARNING} Сумма должна быть положительным числом.", parse_mode=ParseMode.HTML)
+            return
+        if budget > Decimal("1000000"):
+            await message.answer(f"{TG_WARNING} Слишком большая сумма.", parse_mode=ParseMode.HTML)
             return
         symbol = state["symbol"]
         trade_state[message.from_user.id] = {
@@ -291,10 +307,15 @@ async def handle_trade_text(message: Message, session):
             "budget": format(budget, "f"),
             "awaiting": "leverage",
         }
+        # Filter leverage by instrument max
+        max_lev = None
+        inst = await session.get(Instrument, symbol)
+        if inst and inst.max_leverage:
+            max_lev = inst.max_leverage
         await message.answer(
             f"{TG_GEAR} <b>ПЛЕЧО</b>\n\n{symbol} | Маржа: {fmt_money(budget)}\n\nВыберите плечо:",
             parse_mode=ParseMode.HTML,
-            reply_markup=leverage_keyboard(symbol, format(budget, "f")),
+            reply_markup=leverage_keyboard(symbol, format(budget, "f"), max_lev),
         )
         return
 
@@ -380,20 +401,28 @@ async def cb_quick_symbol(callback: CallbackQuery, session):
 
 
 @router.callback_query(F.data.startswith("re_lev:"))
-async def cb_re_leverage(callback: CallbackQuery):
+async def cb_re_leverage(callback: CallbackQuery, session):
     if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
-    _, symbol, budget = callback.data.split(":")
+    try:
+        _, symbol, budget = callback.data.split(":")
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
     trade_state[callback.from_user.id] = {
         "symbol": symbol,
         "budget": budget,
         "awaiting": "leverage",
     }
+    max_lev = None
+    inst = await session.get(Instrument, symbol)
+    if inst and inst.max_leverage:
+        max_lev = inst.max_leverage
     await callback.message.edit_text(
         f"{TG_GEAR} <b>ПЛЕЧО</b>\n\n{symbol} | Маржа: {fmt_money(Decimal(budget))}\n\nВыберите плечо:",
         parse_mode=ParseMode.HTML,
-        reply_markup=leverage_keyboard(symbol, budget),
+        reply_markup=leverage_keyboard(symbol, budget, max_lev),
     )
     await callback.answer()
 
@@ -403,7 +432,11 @@ async def cb_leverage(callback: CallbackQuery):
     if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
-    _, symbol, budget, leverage = callback.data.split(":")
+    try:
+        _, symbol, budget, leverage = callback.data.split(":")
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
     if leverage not in LEVERAGES:
         await callback.answer("Некорректное плечо", show_alert=True)
         return
@@ -426,7 +459,11 @@ async def cb_side(callback: CallbackQuery, session):
     if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
-    _, symbol, budget, leverage, side = callback.data.split(":")
+    try:
+        _, symbol, budget, leverage, side = callback.data.split(":")
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
     if side not in ("LONG", "SHORT"):
         await callback.answer("Некорректное направление", show_alert=True)
         return
@@ -451,7 +488,11 @@ async def cb_tp_sl(callback: CallbackQuery, session):
     if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
-    action, symbol, budget, leverage, side = callback.data.split(":")[1:]
+    try:
+        action, symbol, budget, leverage, side = callback.data.split(":")[1:]
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
     if action == "skip":
         st = {
             "symbol": symbol,
@@ -477,7 +518,35 @@ async def cb_tp_sl(callback: CallbackQuery, session):
         "LONG: TP выше входа, SL ниже.\nSHORT: TP ниже входа, SL выше.\n\n"
         "Чтобы вернуться без TP/SL — нажмите «Пропустить».",
         parse_mode=ParseMode.HTML,
-        reply_markup=back_keyboard("nav:trade"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Назад", callback_data=f"tpsl:back:{symbol}:{budget}:{leverage}:{side}", icon_custom_emoji_id=PIN_ID)]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tpsl:back:"))
+async def cb_tp_sl_back(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
+    try:
+        _, _, symbol, budget, leverage, side = callback.data.split(":")
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    trade_state[callback.from_user.id] = {
+        "symbol": symbol,
+        "budget": budget,
+        "leverage": leverage,
+        "side": side,
+        "awaiting": "tp_sl",
+    }
+    await callback.message.edit_text(
+        f"{TG_STAR} <b>TP/SL</b>\n\n"
+        "Можно установить уровни тейк-профита и стоп-лосса или пропустить этот шаг.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=tp_sl_keyboard(symbol, budget, leverage, side),
     )
     await callback.answer()
 

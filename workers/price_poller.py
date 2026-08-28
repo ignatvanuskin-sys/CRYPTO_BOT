@@ -75,8 +75,14 @@ async def sync_instruments(engine: AsyncEngine):
                 except Exception:
                     pass
                 max_lev = _max_leverage_for_symbol(inst_symbol)
-                try:
-                    async with factory() as session:
+                if 'batch_instruments' not in locals():
+                    batch_instruments = []
+                batch_instruments.append((inst_symbol, base, quote, price_prec, qty_prec, min_qty, max_lev))
+        # Batch upsert all instruments in one transaction
+        if 'batch_instruments' in locals() and batch_instruments:
+            try:
+                async with factory() as session:
+                    for inst_symbol, base, quote, price_prec, qty_prec, min_qty, max_lev in batch_instruments:
                         inst = await session.get(Instrument, inst_symbol)
                         if inst is None:
                             inst = Instrument(
@@ -98,12 +104,11 @@ async def sync_instruments(engine: AsyncEngine):
                             inst.price_precision = price_prec
                             inst.quantity_precision = qty_prec
                             inst.min_quantity = min_qty
-                            # Only upgrade max_leverage, don't downgrade existing higher values
                             if inst.max_leverage < max_lev:
                                 inst.max_leverage = max_lev
-                        await session.commit()
-                except Exception as exc:
-                    logger.warning("Skipping instrument %s: %s", inst_symbol, exc)
+                    await session.commit()
+            except Exception as exc:
+                logger.warning("Batch instruments sync failed: %s", exc)
         logger.info("Instruments sync complete")
     finally:
         await exchange.close()

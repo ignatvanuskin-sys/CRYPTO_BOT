@@ -45,6 +45,9 @@ async def admin_ban(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
+    if not message.text:
+        await message.answer("Использование: /admin_ban <telegram_id> <причина>")
+        return
     parts = message.text.split(maxsplit=2)
     if len(parts) < 2:
         await message.answer("Использование: /admin_ban <telegram_id> <причина>")
@@ -69,6 +72,9 @@ async def admin_ban(message: Message, session):
 async def admin_unban(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
+        return
+    if not message.text:
+        await message.answer("Использование: /admin_unban <telegram_id>")
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip().lstrip("-").isdigit():

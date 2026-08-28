@@ -27,7 +27,7 @@ async def check_and_close_positions(engine: AsyncEngine) -> int:
     closed_count = 0
     async with factory() as session:
         result = await session.execute(
-            select(PaperPosition).where(PaperPosition.status == PositionStatus.OPEN.value)
+            select(PaperPosition).where(PaperPosition.status == PositionStatus.OPEN.value).limit(500)
         )
         positions = result.scalars().all()
         for position in positions:

@@ -12,6 +12,7 @@ from bot.handlers.admin import router as admin_router
 from bot.handlers.leaderboard import router as leaderboard_router
 from bot.handlers.profile import router as profile_router
 from bot.handlers.trade import router as trade_router
+from bot.middlewares.throttling import ThrottlingMiddleware
 from config import settings
 from workers.competition_lifecycle import run_forever as run_competition_lifecycle
 from workers.lock import LOCK_KEY, acquire_advisory_lock, release_advisory_lock
@@ -64,9 +65,13 @@ async def main() -> None:
                         pass
                     raise
 
+        # Throttling: 0.8s per message, 0.3s per callback per user
+        dp.message.middleware(ThrottlingMiddleware(message_rate=0.8, callback_rate=0.3))
+        dp.callback_query.middleware(ThrottlingMiddleware(message_rate=0.8, callback_rate=0.3))
+
         dp.include_router(profile_router)
-        dp.include_router(trade_router)
         dp.include_router(leaderboard_router)
+        dp.include_router(trade_router)
         dp.include_router(admin_router)
 
         # Background tasks inside the SAME process and event loop:

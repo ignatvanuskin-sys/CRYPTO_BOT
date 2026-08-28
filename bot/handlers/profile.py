@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -200,9 +202,10 @@ async def _send_profile(telegram_id: int, session, target: Message | CallbackQue
     rank = f"#{rank_info['rank']}" if rank_info else "—"
     roe = fmt_pct(rank_info["roi"]) if rank_info else "+0.00%"
 
+    safe_name = html.escape(str(user.username or user.telegram_id))[:32]
     text = (
         f"{TG_CROWN} <b>ЛИЧНЫЙ КАБИНЕТ</b>\n\n"
-        f"{tg_emoji(PIN_ID, '📌')} Юзернейм: {user.username or user.telegram_id}\n"
+        f"{tg_emoji(PIN_ID, '📌')} Юзернейм: {safe_name}\n"
         f"{TG_MONEY} Баланс: {fmt_money(account.equity)}\n\n"
         f"{TG_CHART} <b>СДЕЛКИ</b>\n"
         f"Успешных: {wins}\n"
@@ -225,7 +228,7 @@ async def _send_profile(telegram_id: int, session, target: Message | CallbackQue
         await target.answer()
 
 
-async def _send_transactions(telegram_id: int, session, target: Message | CallbackQuery):
+async def _send_transactions(telegram_id: int, session, target: Message | CallbackQuery, offset: int = 0):
     is_callback = isinstance(target, CallbackQuery)
     chat_target = target.message if is_callback else target
     if chat_target is None:
@@ -246,15 +249,22 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         if is_callback:
             await target.answer()
         return
+    # Pagination: 5 per page
+    limit = 5
+    # Get total count for pagination
+    from sqlalchemy import func
+
+    total = (await session.execute(select(func.count()).select_from(PaperPosition).where(PaperPosition.account_id == account.id))).scalar_one()
     positions = (
         await session.execute(
             select(PaperPosition)
             .where(PaperPosition.account_id == account.id)
             .order_by(PaperPosition.opened_at.desc())
-            .limit(15)
+            .limit(limit)
+            .offset(offset)
         )
     ).scalars().all()
-    if not positions:
+    if not positions and offset == 0:
         await chat_target.answer(
             f"{TG_CHART} <b>МОИ СДЕЛКИ</b>\n\nСделок пока нет.\n\nНажмите Торговать, чтобы открыть первую.",
             parse_mode=ParseMode.HTML,
@@ -263,24 +273,37 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         if is_callback:
             await target.answer()
         return
+    if not positions and offset > 0:
+        await chat_target.answer("Больше сделок нет.")
+        if is_callback:
+            await target.answer()
+        return
 
-    open_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            *[
-                [
-                    InlineKeyboardButton(
-                        text=f"Закрыть {p.symbol} {format_side(p.side)}",
-                        callback_data=f"close_preview:{p.id}",
-                        icon_custom_emoji_id=RED_ID,
-                    )
-                ]
-                for p in positions
-                if p.status == PositionStatus.OPEN.value
-            ],
-            [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
+    # Keyboard: close buttons for open positions on this page only
+    kb_rows = [
+        [
+            InlineKeyboardButton(
+                text=f"Закрыть {p.symbol} {format_side(p.side)}",
+                callback_data=f"close_preview:{p.id}",
+                icon_custom_emoji_id=RED_ID,
+            )
         ]
-    )
-    lines = [f"{TG_CHART} <b>МОИ СДЕЛКИ</b>\n"]
+        for p in positions
+        if p.status == PositionStatus.OPEN.value
+    ]
+    # Pagination row
+    pag_row = []
+    if offset > 0:
+        pag_row.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"nav:transactions:{max(0, offset - limit)}", icon_custom_emoji_id=PIN_ID))
+    if offset + limit < total:
+        pag_row.append(InlineKeyboardButton(text="Ещё ▶", callback_data=f"nav:transactions:{offset + limit}", icon_custom_emoji_id=PIN_ID))
+    if pag_row:
+        kb_rows.append(pag_row)
+    kb_rows.append([InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)])
+    open_keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    page_num = offset // limit + 1
+    total_pages = (total + limit - 1) // limit
+    lines = [f"{TG_CHART} <b>МОИ СДЕЛКИ</b> {page_num}/{total_pages} — всего {total}\n"]
     for p in positions:
         side_str = format_side(p.side)
         side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
@@ -290,9 +313,11 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         else:
             pnl_line = f"PnL: {fmt_money(p.realized_pnl)}"
             status_line = f"{tg_emoji(CROSS_ID, '❌')} ЗАКРЫТА"
+        is_open = p.status == PositionStatus.OPEN.value
+        price_label = "Сейчас" if is_open else "Выход"
         lines.append(
             f"{p.symbol} {side_tag} {side_str} x{p.leverage or 1:g}\n"
-            f"Вход: {fmt_price(p.entry_price)} → Выход: {fmt_price(p.current_price)}\n"
+            f"Вход: {fmt_price(p.entry_price)} → {price_label}: {fmt_price(p.current_price)}\n"
             f"{pnl_line} | {status_line}"
         )
     await chat_target.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=open_keyboard)
@@ -311,19 +336,18 @@ async def nav_home(callback: CallbackQuery, session):
     await callback.answer()
 
 
-@router.callback_query(F.data == "nav:profile")
-async def nav_profile(callback: CallbackQuery, session):
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    _trade_state.pop(callback.from_user.id, None)
-    await _send_profile(callback.from_user.id, session, callback)
-
-
-@router.callback_query(F.data == "nav:transactions")
+@router.callback_query(F.data.startswith("nav:transactions"))
 async def nav_transactions(callback: CallbackQuery, session):
     if callback.from_user is None:
         await callback.answer()
         return
     _trade_state.pop(callback.from_user.id, None)
-    await _send_transactions(callback.from_user.id, session, callback)
+    # Parse offset: nav:transactions or nav:transactions:5
+    offset = 0
+    parts = callback.data.split(":")
+    if len(parts) == 3:
+        try:
+            offset = int(parts[2])
+        except ValueError:
+            offset = 0
+    await _send_transactions(callback.from_user.id, session, callback, offset=offset)

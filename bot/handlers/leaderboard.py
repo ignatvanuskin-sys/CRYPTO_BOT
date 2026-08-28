@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import html
+
 from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -48,24 +50,28 @@ def _medal(rank: int) -> str:
     return f"{rank}."
 
 
-def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dict[int, User], is_final: bool) -> str:
-    """Красивая таблица топ-10."""
+def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dict[int, User], is_final: bool, offset: int = 0) -> str:
+    """Красивая таблица топ-10 с пагинацией."""
+    total = len(leaderboard)
+    # For display, slice by offset
+    page = leaderboard[offset:offset+10]
     header = f"{TG_CROWN} <b>{title}</b>\n"
     if is_final:
-        header += f"{TG_STAR} <i>Итоги недели — финальный топ-10</i>\n"
+        header += f"{TG_STAR} <i>Итоги недели — финальный топ-{10 if total>=10 else total}</i>\n"
     else:
-        header += f"{TG_CHART} <i>Live топ-10 — обновляется каждую сделку</i>\n"
+        header += f"{TG_CHART} <i>Live топ — обновляется каждую сделку</i>\n"
+    header += f"Страница {offset//10+1}/{(total+9)//10} — всего {total}\n"
     header += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    if not leaderboard:
+    if not page:
         return header + "Пока нет участников. Открой первую сделку!"
 
     lines = []
-    for entry in leaderboard[:10]:
+    for entry in page:
         rank = entry["rank"]
         user = users_map.get(entry["user_id"])
-        name = (user.username if user and user.username else f"ID{entry['user_id']}")[:16]
-        # Escape html in name? Keep simple
+        raw_name = user.username if user and user.username else f"ID{entry['user_id']}"
+        name = html.escape(raw_name[:16])
         medal = _medal(rank)
         roi = fmt_pct(entry["roi"])
         equity = fmt_money(entry["equity"])
@@ -79,21 +85,21 @@ def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dic
     return header + body
 
 
-async def _get_leaderboard_for_display(session):
-    """Возвращает (title, leaderboard, users_map, is_final, competition)."""
+async def _get_leaderboard_for_display(session, offset: int = 0):
+    """Возвращает (title, leaderboard_page, users_map, is_final, competition, total)."""
     comp = await get_active_competition(session)
     if comp is not None:
-        # Live leaderboard for active
         lb = await build_leaderboard(session, comp.id)
-        # Build users map
-        user_ids = [e["user_id"] for e in lb[:10]]
+        total = len(lb)
+        page = lb[offset:offset+10]
+        user_ids = [e["user_id"] for e in page]
         users_map = {}
         if user_ids:
             res = await session.execute(select(User).where(User.id.in_(user_ids)))
             for u in res.scalars().all():
                 users_map[u.id] = u
         title = comp.name.upper()
-        return title, lb[:10], users_map, False, comp
+        return title, page, users_map, False, comp, total
 
     # No active — show last finished
     res = await session.execute(
@@ -101,11 +107,14 @@ async def _get_leaderboard_for_display(session):
     )
     comp = res.scalar_one_or_none()
     if comp is not None:
-        # Use snapshot if exists
         snap_res = await session.execute(
-            select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id).order_by(LeaderboardSnapshot.rank).limit(10)
+            select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id).order_by(LeaderboardSnapshot.rank).limit(10).offset(offset)
         )
         snaps = snap_res.scalars().all()
+        # Get total count
+        from sqlalchemy import func as sa_func
+
+        total = (await session.execute(select(sa_func.count()).select_from(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id))).scalar_one()
         if snaps:
             lb = []
             for s in snaps:
@@ -117,19 +126,20 @@ async def _get_leaderboard_for_display(session):
                 for u in res2.scalars().all():
                     users_map[u.id] = u
             title = f"{comp.name.upper()} — ФИНАЛ"
-            return title, lb, users_map, True, comp
-        # Fallback to live build if no snapshot
+            return title, lb, users_map, True, comp, total
         lb = await build_leaderboard(session, comp.id)
-        user_ids = [e["user_id"] for e in lb[:10]]
+        total = len(lb)
+        page = lb[offset:offset+10]
+        user_ids = [e["user_id"] for e in page]
         users_map = {}
         if user_ids:
             res = await session.execute(select(User).where(User.id.in_(user_ids)))
             for u in res.scalars().all():
                 users_map[u.id] = u
         title = f"{comp.name.upper()} — ФИНАЛ"
-        return title, lb[:10], users_map, True, comp
+        return title, page, users_map, True, comp, total
 
-    return None, [], {}, False, None
+    return None, [], {}, False, None, 0
 
 
 @router.message(Command("top"))
@@ -146,7 +156,7 @@ async def cmd_top(message: Message, session):
     except Exception:
         pass
 
-    title, lb, users_map, is_final, comp = await _get_leaderboard_for_display(session)
+    title, lb, users_map, is_final, comp, total = await _get_leaderboard_for_display(session, offset=0)
 
     if comp is None:
         await message.answer(

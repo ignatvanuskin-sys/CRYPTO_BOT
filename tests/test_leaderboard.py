@@ -111,7 +111,8 @@ async def test_leaderboard_final_snapshot_used(session):
     await session.commit()
     # Now _get_leaderboard_for_display should return snapshot, not live
     from bot.handlers.leaderboard import _get_leaderboard_for_display
-    title, lb2, users_map, is_final, comp2 = await _get_leaderboard_for_display(session)
+    title, lb2, users_map, is_final, comp2, total = await _get_leaderboard_for_display(session)
     assert is_final is True
     assert "ФИНАЛ" in title
     assert len(lb2) == 3
+    assert total == 3
