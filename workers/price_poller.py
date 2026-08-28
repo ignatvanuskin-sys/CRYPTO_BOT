@@ -258,6 +258,29 @@ async def poll_prices(engine: AsyncEngine) -> None:
         await exchange.close()
 
 async def run_forever(engine: AsyncEngine) -> None:
-    """Background task entrypoint for the single bot process."""
-    await sync_instruments(engine)
-    await poll_prices(engine)
+    """Background task entrypoint for the single bot process.
+
+    Survives BingX/network unavailability at startup: sync_instruments and
+    poll_prices retry with backoff instead of crashing the whole bot process.
+    """
+    delay = 3.0
+    while True:
+        try:
+            await sync_instruments(engine)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("sync_instruments failed (BingX/network unavailable?) — retrying in %.0fs", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, 60.0)
+    while True:
+        try:
+            await poll_prices(engine)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # poll_prices exits only on unrecoverable exchange setup error —
+            # log, wait, and rebuild the exchange connection from scratch.
+            logger.exception("poll_prices crashed — restarting poller in 5s")
+            await asyncio.sleep(5.0)

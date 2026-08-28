@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -183,6 +184,8 @@ async def _account_line(session, user: User) -> str:
 @router.message(Command("trade_ru", ignore_case=True))
 @router.message(F.text == "Торговать")
 async def cmd_trade(message: Message, session):
+    if message.from_user is not None:
+        trade_state.pop(message.from_user.id, None)
     await message.answer(
         f"{TG_CHART_UP} <b>ТОРГОВЛЯ</b>\n\n"
         f"{tg_emoji(DIAMOND_ID, '💎')} Выбрать монету — график пары на BingX\n"
@@ -236,14 +239,15 @@ async def cb_quick_open(callback: CallbackQuery):
 async def handle_trade_text(message: Message, session):
     """Единая точка текстового ввода торгового мастера (тикер/бюджет/TP-SL)."""
     if message.from_user is None or message.text is None:
-        return
+        raise SkipHandler
     # Не перехватываем команды и навигацию — даём другим хендлерам шанс
     if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать", "Топ 10", "Позиции", "Топ"):
         trade_state.pop(message.from_user.id, None)
-        return
+        raise SkipHandler
     state = trade_state.get(message.from_user.id)
     if not state or "awaiting" not in state:
-        return
+        # Свободный текст вне мастера — не наш апдейт, пусть идут дальше по роутерам
+        raise SkipHandler
     step = state["awaiting"]
 
     # --- Шаг: тикер ---

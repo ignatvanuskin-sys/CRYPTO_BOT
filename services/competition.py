@@ -82,21 +82,38 @@ async def join_competition(session: AsyncSession, user_id: int, competition_id: 
     ).scalar_one_or_none()
     is_new_cup = last_part is None or last_part.competition_id != competition_id
     if is_new_cup and acc.id is not None:
-        # Close any open positions from previous cup (should already be closed by lifecycle, but safety)
+        # Force-close open positions from the previous cup BEFORE the reset.
+        # Otherwise the reset refunds their reserved margin implicitly and
+        # close_position credits it AGAIN later — ledger inflation.
         from db.paper_models import PaperPosition, PositionStatus
+        from services.paper_adapter import PaperError, close_position
 
-        open_pos = await session.execute(
-            select(PaperPosition).where(PaperPosition.account_id == acc.id, PaperPosition.status == PositionStatus.OPEN.value)
-        )
-        # For clean sheet, we don't auto-close here — lifecycle does, but we ensure no carryover
-        # Reset account to initial_balance if it's not already
+        open_positions = (
+            await session.execute(
+                select(PaperPosition).where(
+                    PaperPosition.account_id == acc.id,
+                    PaperPosition.status == PositionStatus.OPEN.value,
+                )
+            )
+        ).scalars().all()
+        for position in open_positions:
+            try:
+                await close_position(
+                    session,
+                    position,
+                    acc,
+                    idempotency_key=f"cup_reset:{competition_id}:{position.id}",
+                    reason="manual",
+                )
+            except PaperError:
+                # Stale/unavailable market data — refuse the join rather than
+                # resetting an account with live margin (fail-safe).
+                raise ValueError("Не удалось закрыть позиции прошлого турнира (рынок недоступен). Попробуйте через несколько секунд.")
+        # Clean-sheet reset of the account to the cup's initial balance
         if acc.cash_balance != comp.initial_balance or acc.margin_used != Decimal("0") or acc.equity != comp.initial_balance:
-            # Create adjustment ledger to reset
             from db.paper_models import AccountLedger, LedgerType
 
-            # Close all open positions' unrealized will be handled elsewhere, here just reset balances
             delta = (comp.initial_balance - acc.cash_balance).quantize(Decimal("0.01"))
-            # Only reset if delta !=0
             if delta != Decimal("0"):
                 acc.cash_balance = comp.initial_balance
                 acc.margin_used = Decimal("0")

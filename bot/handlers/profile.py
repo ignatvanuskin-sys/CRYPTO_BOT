@@ -79,6 +79,7 @@ async def send_main_menu(message: Message, text: str = "Главное меню:
 async def cmd_start(message: Message, session):
     if message.from_user is None:
         return
+    _trade_state.pop(message.from_user.id, None)
     user = await _get_user_by_telegram_id(session, message.from_user.id)
     is_new = user is None
     if user is None:
