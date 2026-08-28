@@ -20,7 +20,7 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Торговать", icon_custom_emoji_id=CHART_UP_ID), KeyboardButton(text="Личный кабинет", icon_custom_emoji_id=CROWN_ID)],
-            [KeyboardButton(text="Топ 10", icon_custom_emoji_id=GOLD_ID), KeyboardButton(text="Позиции", icon_custom_emoji_id=CHART_ID)],
+            [KeyboardButton(text="Топ 10", icon_custom_emoji_id=GOLD_ID), KeyboardButton(text="Сделки", icon_custom_emoji_id=CHART_ID)],
         ],
         resize_keyboard=True,
         is_persistent=True,

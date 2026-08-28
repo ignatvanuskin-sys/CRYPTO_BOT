@@ -75,7 +75,7 @@ async def send_main_menu(message: Message, text: str = "Главное меню:
     await message.answer(text, reply_markup=main_menu())
 
 
-@router.message(Command("start"))
+@router.message(Command("start", ignore_case=True))
 async def cmd_start(message: Message, session):
     if message.from_user is None:
         return
@@ -145,10 +145,10 @@ async def handle_contact(message: Message, session):
     )
 
 
-@router.message(Command("profile"))
-@router.message(Command("profil"))
-@router.message(Command("профиль"))
-@router.message(Command("личный_кабинет"))
+@router.message(Command("profile", ignore_case=True))
+@router.message(Command("profil", ignore_case=True))
+@router.message(Command("профиль", ignore_case=True))
+@router.message(Command("личный_кабинет", ignore_case=True))
 @router.message(F.text == "Личный кабинет")
 async def cmd_profile(message: Message, session):
     if message.from_user is None:
@@ -157,11 +157,11 @@ async def cmd_profile(message: Message, session):
     await _send_profile(message.from_user.id, session, message)
 
 
-@router.message(Command("transactions"))
-@router.message(Command("sdelki"))
-@router.message(Command("сделки"))
-@router.message(Command("активные"))
-@router.message(Command("actives"))
+@router.message(Command("transactions", ignore_case=True))
+@router.message(Command("sdelki", ignore_case=True))
+@router.message(Command("сделки", ignore_case=True))
+@router.message(Command("активные", ignore_case=True))
+@router.message(Command("actives", ignore_case=True))
 @router.message(F.text.in_({"Сделки", "Мои сделки", "Активные сделки"}))
 async def cmd_transactions(message: Message, session):
     if message.from_user is None:
@@ -170,11 +170,11 @@ async def cmd_transactions(message: Message, session):
     await _send_transactions(message.from_user.id, session, message)
 
 
-@router.message(Command("history"))
-@router.message(Command("история"))
-@router.message(Command("istoriya"))
-@router.message(Command("все_сделки"))
-@router.message(Command("vse_sdelki"))
+@router.message(Command("history", ignore_case=True))
+@router.message(Command("история", ignore_case=True))
+@router.message(Command("istoriya", ignore_case=True))
+@router.message(Command("все_сделки", ignore_case=True))
+@router.message(Command("vse_sdelki", ignore_case=True))
 @router.message(F.text == "Посмотреть все сделки")
 async def cmd_history(message: Message, session):
     if message.from_user is None:
@@ -369,9 +369,22 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
         return
     from sqlalchemy import func
 
-    # Статистика по закрытым
-    all_closed = (await session.execute(select(PaperPosition).where(PaperPosition.account_id == account.id, PaperPosition.status == PositionStatus.CLOSED.value))).scalars().all()
-    total_closed = len(all_closed)
+    # Статистика по закрытым — SQL-агрегаты одним запросом (не грузим все строки)
+    stats = (
+        await session.execute(
+            select(
+                func.count(PaperPosition.id),
+                func.coalesce(func.sum(PaperPosition.realized_pnl), 0),
+                func.max(PaperPosition.realized_pnl),
+                func.min(PaperPosition.realized_pnl),
+            ).where(PaperPosition.account_id == account.id, PaperPosition.status == PositionStatus.CLOSED.value)
+        )
+    ).one()
+    total_closed, total_pnl_raw, best_raw, worst_raw = stats
+    total_closed = int(total_closed or 0)
+    total_pnl = Decimal(str(total_pnl_raw)).quantize(Decimal("0.01"))
+    best = Decimal(str(best_raw)) if best_raw is not None else Decimal("0")
+    worst = Decimal(str(worst_raw)) if worst_raw is not None else Decimal("0")
     if total_closed == 0:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -388,16 +401,33 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
             await target.answer()
         return
 
-    wins = [p for p in all_closed if p.realized_pnl > 0]
-    losses = [p for p in all_closed if p.realized_pnl <= 0]
-    win_cnt = len(wins)
-    loss_cnt = len(losses)
+    # Счётчик успешных/неуспешных — вторым лёгким запросом
+    win_cnt = int((await session.execute(
+        select(func.count(PaperPosition.id)).where(
+            PaperPosition.account_id == account.id,
+            PaperPosition.status == PositionStatus.CLOSED.value,
+            PaperPosition.realized_pnl > 0,
+        )
+    )).scalar_one())
+    loss_cnt = total_closed - win_cnt
     win_rate = (win_cnt / total_closed * 100) if total_closed else 0
-    total_pnl = sum((p.realized_pnl for p in all_closed), Decimal("0"))
-    plus = sum((p.realized_pnl for p in wins), Decimal("0"))
-    minus = sum((p.realized_pnl for p in losses), Decimal("0"))
-    best = max((p.realized_pnl for p in all_closed), default=Decimal("0"))
-    worst = min((p.realized_pnl for p in all_closed), default=Decimal("0"))
+    # Плюс/минус бюджета: сумма pnl по выигравшим и проигравшим
+    plus_raw = (await session.execute(
+        select(func.coalesce(func.sum(PaperPosition.realized_pnl), 0)).where(
+            PaperPosition.account_id == account.id,
+            PaperPosition.status == PositionStatus.CLOSED.value,
+            PaperPosition.realized_pnl > 0,
+        )
+    )).scalar_one()
+    minus_raw = (await session.execute(
+        select(func.coalesce(func.sum(PaperPosition.realized_pnl), 0)).where(
+            PaperPosition.account_id == account.id,
+            PaperPosition.status == PositionStatus.CLOSED.value,
+            PaperPosition.realized_pnl <= 0,
+        )
+    )).scalar_one()
+    plus = Decimal(str(plus_raw)).quantize(Decimal("0.01"))
+    minus = Decimal(str(minus_raw)).quantize(Decimal("0.01"))
 
     limit = 5
     positions = (

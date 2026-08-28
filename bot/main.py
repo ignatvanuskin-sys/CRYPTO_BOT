@@ -98,9 +98,9 @@ async def main() -> None:
                         pass
                     raise
 
-        # Throttling: 0.8s per message, 0.3s per callback per user
-        dp.message.middleware(ThrottlingMiddleware(message_rate=0.8, callback_rate=0.3))
-        dp.callback_query.middleware(ThrottlingMiddleware(message_rate=0.8, callback_rate=0.3))
+        # Throttling: 0.8s per message, 0.3s per callback per user — один инстанс на оба типа
+        throttle = ThrottlingMiddleware(message_rate=0.8, callback_rate=0.3)
+        throttle.register(dp)
 
         dp.include_router(profile_router)
         dp.include_router(leaderboard_router)

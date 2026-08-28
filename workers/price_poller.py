@@ -148,6 +148,7 @@ async def _get_relevant_symbols(engine: AsyncEngine) -> list[str]:
                 return list(active) if active else list(all_syms)
             return []
     except Exception:
+        logger.exception("_get_relevant_symbols failed — falling back to DEMO_WATCHLIST")
         return DEMO_WATCHLIST
 
 

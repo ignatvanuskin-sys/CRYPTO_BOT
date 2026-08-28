@@ -31,7 +31,7 @@ TG_SIREN = tg_emoji(SIREN_ID, "🚨")
 def is_admin(telegram_id: int) -> bool:
     return telegram_id in settings.admin_ids_set
 
-@router.message(Command("admin_stats"))
+@router.message(Command("admin_stats", ignore_case=True))
 async def admin_stats(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
@@ -40,7 +40,7 @@ async def admin_stats(message: Message, session):
     pos_count = (await session.execute(select(func.count()).select_from(PaperPosition))).scalar_one()
     await message.answer(f"Users: {user_count}\nPaper positions rows: {pos_count}")
 
-@router.message(Command("admin_ban"))
+@router.message(Command("admin_ban", ignore_case=True))
 async def admin_ban(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
@@ -68,7 +68,7 @@ async def admin_ban(message: Message, session):
     await session.commit()
     await message.answer(f"Забанен {tid}")
 
-@router.message(Command("admin_unban"))
+@router.message(Command("admin_unban", ignore_case=True))
 async def admin_unban(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
@@ -90,7 +90,7 @@ async def admin_unban(message: Message, session):
     await session.commit()
     await message.answer(f"{TG_CHECK} Пользователь {telegram_id} разблокирован", parse_mode=ParseMode.HTML)
 
-@router.message(Command("admin_active_competition"))
+@router.message(Command("admin_active_competition", ignore_case=True))
 async def admin_active_competition(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
@@ -112,7 +112,7 @@ async def admin_active_competition(message: Message, session):
         parse_mode=ParseMode.HTML,
     )
 
-@router.message(Command("admin_create_demo_cup"))
+@router.message(Command("admin_create_demo_cup", ignore_case=True))
 async def admin_create_demo_cup(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
@@ -134,7 +134,7 @@ async def admin_create_demo_cup(message: Message, session):
         parse_mode=ParseMode.HTML,
     )
 
-@router.message(Command("admin_seed_demo_players"))
+@router.message(Command("admin_seed_demo_players", ignore_case=True))
 async def admin_seed_demo_players(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
@@ -163,7 +163,7 @@ async def admin_seed_demo_players(message: Message, session):
     await session.commit()
     await message.answer(f"{TG_CHECK} Симулированные игроки готовы: создано новых {created}.", parse_mode=ParseMode.HTML)
 
-@router.message(Command("admin_reconcile"))
+@router.message(Command("admin_reconcile", ignore_case=True))
 async def admin_reconcile(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
@@ -182,7 +182,7 @@ async def admin_reconcile(message: Message, session):
     await session.commit()
     await message.answer(f"{TG_CHECK} Рейтинг пересчитан. Участников: {len(leaderboard)}", parse_mode=ParseMode.HTML)
 
-@router.message(Command("admin_finish_competition"))
+@router.message(Command("admin_finish_competition", ignore_case=True))
 async def admin_finish_competition(message: Message, session):
     """Ручной триггер завершения турнира (фолбэк к фоновой задаче lifecycle)."""
     if message.from_user is None or not is_admin(message.from_user.id):
@@ -210,7 +210,7 @@ async def admin_finish_competition(message: Message, session):
         return
     await message.answer(f"{TG_CHECK} Турнир завершён и рейтинг/призы зафиксированы." if finished else "Турнир уже завершён.", parse_mode=ParseMode.HTML)
 
-@router.message(Command("admin_product_stats"))
+@router.message(Command("admin_product_stats", ignore_case=True))
 async def admin_product_stats(message: Message, session):
     if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")

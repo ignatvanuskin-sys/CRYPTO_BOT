@@ -177,10 +177,10 @@ async def _account_line(session, user: User) -> str:
     return f"Доступно: {fmt_money(account.available_margin)}"
 
 
-@router.message(Command("trade"))
-@router.message(Command("торговать"))
-@router.message(Command("torgovat"))
-@router.message(Command("trade_ru"))
+@router.message(Command("trade", ignore_case=True))
+@router.message(Command("торговать", ignore_case=True))
+@router.message(Command("torgovat", ignore_case=True))
+@router.message(Command("trade_ru", ignore_case=True))
 @router.message(F.text == "Торговать")
 async def cmd_trade(message: Message, session):
     await message.answer(
@@ -238,7 +238,7 @@ async def handle_trade_text(message: Message, session):
     if message.from_user is None or message.text is None:
         return
     # Не перехватываем команды и навигацию — даём другим хендлерам шанс
-    if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать"):
+    if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать", "Топ 10", "Позиции", "Топ"):
         trade_state.pop(message.from_user.id, None)
         return
     state = trade_state.get(message.from_user.id)
@@ -496,6 +496,24 @@ async def cb_tp_sl(callback: CallbackQuery, session):
     except ValueError:
         await callback.answer("Некорректные данные", show_alert=True)
         return
+    if action == "back":
+        # Вернуться к селектору TP/SL (не к вводу)
+        st = {
+            "symbol": symbol,
+            "budget": budget,
+            "leverage": leverage,
+            "side": side,
+            "awaiting": "tp_sl",
+        }
+        trade_state[callback.from_user.id] = st
+        await callback.message.edit_text(
+            f"{TG_STAR} <b>TP/SL</b>\n\n"
+            "Можно установить уровни тейк-профита и стоп-лосса или пропустить этот шаг.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tp_sl_keyboard(symbol, budget, leverage, side),
+        )
+        await callback.answer()
+        return
     if action == "skip":
         st = {
             "symbol": symbol,
@@ -524,32 +542,6 @@ async def cb_tp_sl(callback: CallbackQuery, session):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Назад", callback_data=f"tpsl:back:{symbol}:{budget}:{leverage}:{side}", icon_custom_emoji_id=PIN_ID)]
         ]),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("tpsl:back:"))
-async def cb_tp_sl_back(callback: CallbackQuery, session):
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    try:
-        _, _, symbol, budget, leverage, side = callback.data.split(":")
-    except ValueError:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    trade_state[callback.from_user.id] = {
-        "symbol": symbol,
-        "budget": budget,
-        "leverage": leverage,
-        "side": side,
-        "awaiting": "tp_sl",
-    }
-    await callback.message.edit_text(
-        f"{TG_STAR} <b>TP/SL</b>\n\n"
-        "Можно установить уровни тейк-профита и стоп-лосса или пропустить этот шаг.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=tp_sl_keyboard(symbol, budget, leverage, side),
     )
     await callback.answer()
 

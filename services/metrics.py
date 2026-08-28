@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from collections import Counter
-from threading import Lock
+import atexit
 import json
 import os
+import threading
+import time
+from collections import Counter
 from pathlib import Path
 
 _PERSIST_PATH = Path(os.getenv("METRICS_PATH", "metrics.json"))
+_PERSIST_INTERVAL = float(os.getenv("METRICS_PERSIST_INTERVAL", "10"))  # seconds
 
 _COUNTERS: Counter[str] = Counter()
-_LOCK = Lock()
+_LOCK = threading.Lock()
+_last_write = 0.0
 
 # Load persisted metrics on import
 try:
@@ -21,9 +25,9 @@ except Exception:
     pass
 
 
-def _persist() -> None:
+def _do_write() -> None:
     try:
-        # Write to temp then rename for atomicity
+        _PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = _PERSIST_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(dict(_COUNTERS), ensure_ascii=False), encoding="utf-8")
         tmp.replace(_PERSIST_PATH)
@@ -31,11 +35,26 @@ def _persist() -> None:
         pass
 
 
+def _persist_if_due() -> None:
+    """Write at most once per _PERSIST_INTERVAL — cheap debounce, no blocking writes per increment."""
+    global _last_write
+    now = time.monotonic()
+    if now - _last_write >= _PERSIST_INTERVAL:
+        _last_write = now
+        _do_write()
+
+
+def _persist_now() -> None:
+    global _last_write
+    _last_write = time.monotonic()
+    _do_write()
+
+
 def increment(name: str, value: int = 1) -> None:
-    """Increment metric; persisted to file for survival across restarts."""
+    """Increment in-memory metric; debounced flush to disk at most once per interval."""
     with _LOCK:
         _COUNTERS[name] += value
-        _persist()
+        _persist_if_due()
 
 
 def snapshot() -> dict[str, int]:
@@ -46,4 +65,13 @@ def snapshot() -> dict[str, int]:
 def reset() -> None:
     with _LOCK:
         _COUNTERS.clear()
-        _persist()
+        _persist_now()
+
+
+def flush() -> None:
+    """Force write (used on shutdown)."""
+    with _LOCK:
+        _persist_now()
+
+
+atexit.register(flush)

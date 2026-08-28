@@ -86,20 +86,23 @@ def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dic
 
 
 async def _get_leaderboard_for_display(session, offset: int = 0):
-    """Возвращает (title, leaderboard_page, users_map, is_final, competition, total)."""
+    """Возвращает (title, full_leaderboard, users_map, is_final, competition, total).
+
+    Возвращает ПОЛНЫЙ список — форматтер сам режет страницу по offset,
+    а футер «Твоё место» всегда находит юзера независимо от страницы.
+    """
     comp = await get_active_competition(session)
     if comp is not None:
         lb = await build_leaderboard(session, comp.id)
         total = len(lb)
-        page = lb[offset:offset+10]
-        user_ids = [e["user_id"] for e in page]
+        user_ids = [e["user_id"] for e in lb[offset:offset+10]]
         users_map = {}
         if user_ids:
             res = await session.execute(select(User).where(User.id.in_(user_ids)))
             for u in res.scalars().all():
                 users_map[u.id] = u
         title = comp.name.upper()
-        return title, page, users_map, False, comp, total
+        return title, lb, users_map, False, comp, total
 
     # No active — show last finished
     res = await session.execute(
@@ -107,19 +110,18 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
     )
     comp = res.scalar_one_or_none()
     if comp is not None:
-        snap_res = await session.execute(
-            select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id).order_by(LeaderboardSnapshot.rank).limit(10).offset(offset)
-        )
-        snaps = snap_res.scalars().all()
-        # Get total count
         from sqlalchemy import func as sa_func
 
         total = (await session.execute(select(sa_func.count()).select_from(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id))).scalar_one()
+        snap_res = await session.execute(
+            select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id).order_by(LeaderboardSnapshot.rank)
+        )
+        snaps = snap_res.scalars().all()
         if snaps:
             lb = []
             for s in snaps:
                 lb.append({"rank": s.rank, "user_id": s.user_id, "roi": s.roi, "equity": s.equity})
-            user_ids = [s.user_id for s in snaps]
+            user_ids = [e["user_id"] for e in lb[offset:offset+10]]
             users_map = {}
             if user_ids:
                 res2 = await session.execute(select(User).where(User.id.in_(user_ids)))
@@ -129,25 +131,24 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
             return title, lb, users_map, True, comp, total
         lb = await build_leaderboard(session, comp.id)
         total = len(lb)
-        page = lb[offset:offset+10]
-        user_ids = [e["user_id"] for e in page]
+        user_ids = [e["user_id"] for e in lb[offset:offset+10]]
         users_map = {}
         if user_ids:
             res = await session.execute(select(User).where(User.id.in_(user_ids)))
             for u in res.scalars().all():
                 users_map[u.id] = u
         title = f"{comp.name.upper()} — ФИНАЛ"
-        return title, page, users_map, True, comp, total
+        return title, lb, users_map, True, comp, total
 
     return None, [], {}, False, None, 0
 
 
-@router.message(Command("top"))
-@router.message(Command("топ"))
-@router.message(Command("leaderboard"))
-@router.message(Command("leaders"))
-@router.message(Command("лидеры"))
-@router.message(Command("таблица_лидеров"))
+@router.message(Command("top", ignore_case=True))
+@router.message(Command("топ", ignore_case=True))
+@router.message(Command("leaderboard", ignore_case=True))
+@router.message(Command("leaders", ignore_case=True))
+@router.message(Command("лидеры", ignore_case=True))
+@router.message(Command("таблица_лидеров", ignore_case=True))
 @router.message(F.text.in_({"Топ", "Топ 10", "Лидеры", "Таблица лидеров", "🏆 Топ 10", "🏆 Топ"}))
 async def cmd_top(message: Message, session):
     if message.from_user is None:
@@ -169,25 +170,23 @@ async def cmd_top(message: Message, session):
         )
         return
 
-    text = _format_leaderboard_text(title, lb, users_map, is_final)
-    # Add user's own rank footer
+    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=0)
+    # Add user's own rank footer — lb is the FULL list, user is always findable
     user = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
-    if user:
-        rank_info = await get_user_rank(session, comp.id, user.id) if not is_final else None
-        # For final, try to get from snapshot
-        if is_final:
-            snap = (await session.execute(select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id, LeaderboardSnapshot.user_id == user.id))).scalar_one_or_none()
-            if snap:
-                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{snap.rank}</b>  {fmt_pct(snap.roi)}"
-            else:
-                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты не в топ-10 этой недели"
-        elif rank_info:
-            if rank_info["rank"] <= 10:
-                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{rank_info['rank']}</b>  {fmt_pct(rank_info['roi'])}"
-            else:
-                need = rank_info.get("need_for_top10")
-                need_str = f" до топ-10 нужно {fmt_pct(need)}" if need is not None else ""
-                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{rank_info['rank']}</b>  {fmt_pct(rank_info['roi'])}{need_str}"
+    if user and not is_final:
+        entry = next((e for e in lb if e["user_id"] == user.id), None)
+        if entry is None:
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты пока не участвуешь — открой сделку!"
+        elif entry["rank"] <= 10:
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{entry['rank']}</b>  {fmt_pct(entry['roi'])}"
+        else:
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>  {fmt_pct(entry['roi'])}"
+    elif user and is_final:
+        snap = (await session.execute(select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id, LeaderboardSnapshot.user_id == user.id))).scalar_one_or_none()
+        if snap:
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{snap.rank}</b>  {fmt_pct(snap.roi)}"
+        else:
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты не в топ-10 этой недели"
 
     # Time left for active
     if comp and not is_final:
@@ -212,10 +211,10 @@ async def cmd_top(message: Message, session):
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-@router.message(Command("positions"))
-@router.message(Command("позиции"))
-@router.message(Command("pozicii"))
-@router.message(Command("открытые"))
+@router.message(Command("positions", ignore_case=True))
+@router.message(Command("позиции", ignore_case=True))
+@router.message(Command("pozicii", ignore_case=True))
+@router.message(Command("открытые", ignore_case=True))
 @router.message(F.text.in_({"Позиции", "Открытые позиции", "Мои позиции"}))
 async def cmd_positions(message: Message, session):
     if message.from_user is None:
@@ -315,7 +314,7 @@ async def nav_top(callback: CallbackQuery, session):
         await callback.answer()
         return
     text = _format_leaderboard_text(title, lb, users_map, is_final, offset=offset)
-    # Add user rank footer (always, even if not on current page)
+    # Add user rank footer — lb is the FULL list, no second build needed
     user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if user and comp:
         if is_final:
@@ -325,12 +324,13 @@ async def nav_top(callback: CallbackQuery, session):
             else:
                 text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты не в топ-10"
         else:
-            rank_info = await get_user_rank(session, comp.id, user.id)
-            if rank_info:
-                if rank_info["rank"] <= 10:
-                    text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{rank_info['rank']}</b>"
-                else:
-                    text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{rank_info['rank']}</b>"
+            entry = next((e for e in lb if e["user_id"] == user.id), None)
+            if entry is None:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты пока не участвуешь — открой сделку!"
+            elif entry["rank"] <= 10:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{entry['rank']}</b>"
+            else:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>"
 
     if comp and not is_final:
         secs = max(0, int((comp.ends_at - datetime.now(timezone.utc)).total_seconds()))
