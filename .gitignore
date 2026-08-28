@@ -16,3 +16,5 @@ build/
 .workbuddy-ai/
 pytest_out.txt
 query
+
+metrics.json

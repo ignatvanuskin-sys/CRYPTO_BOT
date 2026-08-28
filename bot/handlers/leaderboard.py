@@ -198,13 +198,14 @@ async def cmd_top(message: Message, session):
             time_left = f"{hours}ч {mins}м"
         text += f"\n{tg_emoji('5413879192267805083', '🗓')} До итогов: {time_left}"
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Обновить", callback_data="nav:top", icon_custom_emoji_id=CHART_ID)],
-            [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")],
-            [InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)],
-        ]
-    )
+    # Pagination for initial view (page 0)
+    kb_rows = []
+    if total > 10:
+        kb_rows.append([InlineKeyboardButton(text="Ещё ▶", callback_data="nav:top:10", icon_custom_emoji_id=PIN_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data="nav:top:0", icon_custom_emoji_id=CHART_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")])
+    kb_rows.append([InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
@@ -278,9 +279,9 @@ async def cmd_positions(message: Message, session):
     )
 
 
-@router.callback_query(F.data == "nav:top")
+@router.callback_query(F.data.startswith("nav:top"))
 async def nav_top(callback: CallbackQuery, session):
-    # Reuse cmd_top logic but for callback
+    # Reuse cmd_top logic but for callback, supports pagination nav:top:10 etc.
     if callback.from_user is None:
         await callback.answer()
         return
@@ -289,8 +290,15 @@ async def nav_top(callback: CallbackQuery, session):
         trade_state.pop(callback.from_user.id, None)
     except Exception:
         pass
-    # Build same as cmd_top but answer via callback.message
-    title, lb, users_map, is_final, comp = await _get_leaderboard_for_display(session)
+    # Parse offset
+    offset = 0
+    parts = callback.data.split(":")
+    if len(parts) == 3:
+        try:
+            offset = int(parts[2])
+        except ValueError:
+            offset = 0
+    title, lb, users_map, is_final, comp, total = await _get_leaderboard_for_display(session, offset=offset)
     if comp is None:
         if callback.message:
             await callback.message.answer(
@@ -300,8 +308,8 @@ async def nav_top(callback: CallbackQuery, session):
             )
         await callback.answer()
         return
-    text = _format_leaderboard_text(title, lb, users_map, is_final)
-    # Add user rank footer
+    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=offset)
+    # Add user rank footer (always, even if not on current page)
     user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if user and comp:
         if is_final:
@@ -326,13 +334,19 @@ async def nav_top(callback: CallbackQuery, session):
         time_left = f"{days}д {hours}ч" if days > 0 else f"{hours}ч {mins}м"
         text += f"\n{tg_emoji('5413879192267805083', '🗓')} До итогов: {time_left}"
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Обновить", callback_data="nav:top", icon_custom_emoji_id=CHART_ID)],
-            [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")],
-            [InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)],
-        ]
-    )
+    # Pagination keyboard
+    kb_rows = []
+    pag = []
+    if offset > 0:
+        pag.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"nav:top:{max(0, offset-10)}", icon_custom_emoji_id=PIN_ID))
+    if offset + 10 < total:
+        pag.append(InlineKeyboardButton(text="Ещё ▶", callback_data=f"nav:top:{offset+10}", icon_custom_emoji_id=PIN_ID))
+    if pag:
+        kb_rows.append(pag)
+    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"nav:top:{offset}", icon_custom_emoji_id=CHART_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")])
+    kb_rows.append([InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     if callback.message:
         try:
             await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)

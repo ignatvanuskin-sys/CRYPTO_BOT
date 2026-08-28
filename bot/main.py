@@ -8,6 +8,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+import os
+
+from aiohttp import web
+
 from bot.handlers.admin import router as admin_router
 from bot.handlers.leaderboard import router as leaderboard_router
 from bot.handlers.profile import router as profile_router
@@ -20,6 +24,35 @@ from workers.price_poller import run_forever as run_price_poller
 from workers.tp_sl_engine import run_forever as run_tp_sl_engine
 
 logger = logging.getLogger(__name__)
+
+
+async def _healthcheck_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "bot": "CRYPTO_BOT"})
+
+
+async def _metrics_handler(request: web.Request) -> web.Response:
+    from services.metrics import snapshot
+
+    return web.json_response(snapshot())
+
+
+async def _run_healthcheck_app() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/health", _healthcheck_handler)
+    app.router.add_get("/metrics", _metrics_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Healthcheck listening on :%s /health", port)
+    # Keep running until cancelled
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        await runner.cleanup()
+        raise
 
 
 async def main() -> None:
@@ -80,6 +113,7 @@ async def main() -> None:
             asyncio.create_task(run_price_poller(engine), name="price_poller"),
             asyncio.create_task(run_tp_sl_engine(engine), name="tp_sl_engine"),
             asyncio.create_task(run_competition_lifecycle(engine), name="competition_lifecycle"),
+            asyncio.create_task(_run_healthcheck_app(), name="healthcheck"),
         ]
 
         logger.info("Single-process bot starting: polling + price poller + TP/SL + competition lifecycle")
