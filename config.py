@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     initial_balance_usd: str = Field(default="10000", alias="INITIAL_BALANCE_USD")
     paper_slippage_bps: int = Field(default=0, alias="PAPER_SLIPPAGE_BPS")
     bingx_market_type: str = Field(default="perpetual", alias="BINGX_MARKET_TYPE")
-    market_data_max_age_ms: int = Field(default=2000, alias="MARKET_DATA_MAX_AGE_MS")
+    market_data_max_age_ms: int = Field(default=10000, alias="MARKET_DATA_MAX_AGE_MS")
     price_poll_interval_seconds: int = Field(default=2, alias="PRICE_POLL_INTERVAL_SECONDS")
     admin_telegram_ids: str = Field(default="", alias="ADMIN_TELEGRAM_IDS")
     demo_seed_enabled: bool = Field(default=False, alias="DEMO_SEED_ENABLED")
