@@ -23,6 +23,15 @@ consecutive_failures: int = 0
 last_alert_at: datetime | None = None
 ALERT_THRESHOLD = 5  # после N подряд ошибок — критичный алерт в лог
 
+def _max_leverage_for_symbol(symbol: str) -> int:
+    if symbol in ("BTCUSDT", "ETHUSDT"):
+        return 300
+    if symbol == "SOLUSDT":
+        return 100
+    # Default for most alts
+    return 50
+
+
 async def sync_instruments(engine: AsyncEngine):
     """Fetch USDT perpetual symbols from BingX via ccxt and upsert into instruments."""
     exchange = ccxt.bingx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
@@ -39,6 +48,33 @@ async def sync_instruments(engine: AsyncEngine):
                     continue
                 base = market.get('base', '')
                 quote = market.get('quote', '')
+                # Derive precisions from market info
+                price_prec = 2
+                qty_prec = 6
+                min_qty = Decimal("0.000001")
+                try:
+                    # Use market precision if available
+                    p = market.get('precision', {})
+                    if p.get('price') is not None:
+                        # price precision is like 0.1, 0.001, 1e-05
+                        price_step = Decimal(str(p['price']))
+                        # Convert step to decimals: 0.1 -> 1, 0.001 -> 3, 1e-05 -> 5
+                        price_prec = max(0, -price_step.as_tuple().exponent)
+                    if p.get('amount') is not None:
+                        amt_step = Decimal(str(p['amount']))
+                        qty_prec = max(0, -amt_step.as_tuple().exponent)
+                    # min quantity from limits or info
+                    limits = market.get('limits', {})
+                    amt_limits = limits.get('amount', {})
+                    if amt_limits and amt_limits.get('min') is not None:
+                        min_qty = Decimal(str(amt_limits['min']))
+                    else:
+                        info = market.get('info', {})
+                        if info.get('tradeMinQuantity'):
+                            min_qty = Decimal(str(info['tradeMinQuantity']))
+                except Exception:
+                    pass
+                max_lev = _max_leverage_for_symbol(inst_symbol)
                 try:
                     async with factory() as session:
                         inst = await session.get(Instrument, inst_symbol)
@@ -48,9 +84,10 @@ async def sync_instruments(engine: AsyncEngine):
                                 base_asset=base,
                                 quote_asset=quote,
                                 status='active',
-                                price_precision=2,
-                                quantity_precision=6,
-                                min_quantity=Decimal("0.000001"),
+                                price_precision=price_prec,
+                                quantity_precision=qty_prec,
+                                min_quantity=min_qty,
+                                max_leverage=max_lev,
                                 created_at=datetime.now(timezone.utc),
                             )
                             session.add(inst)
@@ -58,6 +95,12 @@ async def sync_instruments(engine: AsyncEngine):
                             inst.base_asset = base
                             inst.quote_asset = quote
                             inst.status = 'active'
+                            inst.price_precision = price_prec
+                            inst.quantity_precision = qty_prec
+                            inst.min_quantity = min_qty
+                            # Only upgrade max_leverage, don't downgrade existing higher values
+                            if inst.max_leverage < max_lev:
+                                inst.max_leverage = max_lev
                         await session.commit()
                 except Exception as exc:
                     logger.warning("Skipping instrument %s: %s", inst_symbol, exc)

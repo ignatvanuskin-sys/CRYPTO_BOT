@@ -34,7 +34,7 @@ from bot.emojis import (
     TG_LONG,
     TG_SHORT,
 )
-from bot.views import back_keyboard, bingx_chart_url, fmt_money, get_display_snapshot
+from bot.views import back_keyboard, bingx_chart_url, fmt_money, fmt_price, format_side, get_display_snapshot
 from config import settings
 from db.models import User
 from db.paper_models import Instrument, PaperPosition, PositionStatus, TradingAccount
@@ -46,7 +46,7 @@ from services.trading_account import get_or_create_trading_account
 router = Router()
 trade_state: dict[int, dict] = {}
 
-LEVERAGES = ["1", "2", "5", "10", "20"]
+LEVERAGES = ["1", "2", "5", "10", "20", "50", "100", "150", "300"]
 
 TG_WARNING = tg_emoji(WARNING_ID, "⚠️")
 TG_CHECK = tg_emoji(CHECK_ID, "✔️")
@@ -90,12 +90,21 @@ def trade_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def leverage_keyboard(symbol: str, budget: str) -> InlineKeyboardMarkup:
-    row = [
+    # Split into two rows for readability (Telegram max 8 per row)
+    row1 = [
         InlineKeyboardButton(text=f"{lev}x", callback_data=f"lev:{symbol}:{budget}:{lev}", icon_custom_emoji_id=GEAR_ID)
-        for lev in LEVERAGES
+        for lev in LEVERAGES[:5]
+    ]
+    row2 = [
+        InlineKeyboardButton(text=f"{lev}x", callback_data=f"lev:{symbol}:{budget}:{lev}", icon_custom_emoji_id=GEAR_ID)
+        for lev in LEVERAGES[5:]
     ]
     return InlineKeyboardMarkup(
-        inline_keyboard=[row, [InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)]]
+        inline_keyboard=[
+            row1,
+            row2,
+            [InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)],
+        ]
     )
 
 
@@ -235,7 +244,7 @@ async def handle_trade_text(message: Message, session):
         if step == "ticker_chart":
             trade_state.pop(message.from_user.id, None)
             snapshot = await get_display_snapshot(session, symbol)
-            price_line = f"Текущая цена: {fmt_money(snapshot.last)}\n\n" if snapshot else ""
+            price_line = f"Текущая цена: {fmt_price(snapshot.last)}\n\n" if snapshot else ""
             await message.answer(
                 f"{TG_CHART} {inst.base_asset}/{inst.quote_asset} (BingX Perpetual)\n\n"
                 f"{price_line}"
@@ -328,7 +337,7 @@ async def _show_confirmation(message: Message, state: dict, session):
     notional = (budget * leverage).quantize(Decimal("0.01"))
     side_tag = TG_LONG if side == "LONG" else TG_SHORT
     state_line = (
-        f"Цена входа ({side_word}): {fmt_money(entry)}\n" if entry else f"{TG_WARNING} Цена временно недоступна — исполнение по серверной цене BingX.\n"
+        f"Цена входа ({side_word}): {fmt_price(entry)}\n" if entry else f"{TG_WARNING} Цена временно недоступна — исполнение по серверной цене BingX.\n"
     )
     await message.answer(
         f"{TG_SIREN} <b>ПОДТВЕРЖДЕНИЕ СДЕЛКИ</b>\n\n"
@@ -337,8 +346,8 @@ async def _show_confirmation(message: Message, state: dict, session):
         f"Маржа (бюджет): {fmt_money(budget)}\n"
         f"Плечо: {leverage:g}x | Объём: {fmt_money(notional)}\n\n"
         f"{state_line}"
-        f"{TG_STAR} TP: {fmt_money(tp) if tp else 'нет'}\n"
-        f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_money(sl) if sl else 'нет'}\n\n"
+        f"{TG_STAR} TP: {fmt_price(tp) if tp else 'нет'}\n"
+        f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(sl) if sl else 'нет'}\n\n"
         "Исполнение — по серверной цене BingX в момент подтверждения.",
         parse_mode=ParseMode.HTML,
         reply_markup=confirm_keyboard(),
@@ -521,11 +530,11 @@ async def cb_confirm(callback: CallbackQuery, session):
         side_tag = TG_LONG if position.side == "LONG" else TG_SHORT
         await callback.message.edit_text(
             f"{TG_CHECK} <b>ПОЗИЦИЯ ОТКРЫТА</b>\n\n"
-            f"{position.symbol} {side_tag} {position.side} x{position.leverage:g}\n"
-            f"Вход: {fmt_money(position.entry_price)}\n"
+            f"{position.symbol} {side_tag} {format_side(position.side)} x{position.leverage:g}\n"
+            f"Вход: {fmt_price(position.entry_price)}\n"
             f"Маржа: {fmt_money(Decimal(state['budget']))} | Объём: {fmt_money(position.notional)}\n"
-            f"{TG_STAR} TP: {fmt_money(position.take_profit) if position.take_profit else 'нет'}\n"
-            f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_money(position.stop_loss) if position.stop_loss else 'нет'}\n\n"
+            f"{TG_STAR} TP: {fmt_price(position.take_profit) if position.take_profit else 'нет'}\n"
+            f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(position.stop_loss) if position.stop_loss else 'нет'}\n\n"
             f"PnL обновляется в {TG_CHART} Мои сделки по живым ценам BingX.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
@@ -591,9 +600,9 @@ async def cb_close_preview(callback: CallbackQuery, session):
     side_tag = TG_LONG if position.side == "LONG" else TG_SHORT
     await callback.message.edit_text(
         f"{TG_SIREN} <b>ЗАКРЫТИЕ ПОЗИЦИИ</b>\n\n"
-        f"{position.symbol} {side_tag} {position.side} x{position.leverage:g}\n"
-        f"Вход: {fmt_money(position.entry_price)}\n"
-        f"Текущая цена: {fmt_money(current) if current else f'{TG_WARNING} рынок недоступен'}\n"
+        f"{position.symbol} {side_tag} {format_side(position.side)} x{position.leverage:g}\n"
+        f"Вход: {fmt_price(position.entry_price)}\n"
+        f"Текущая цена: {fmt_price(current) if current else f'{TG_WARNING} рынок недоступен'}\n"
         f"Ожидаемый PnL: {fmt_money(pnl) if pnl is not None else '—'}\n\n"
         "LONG закроется по BID, SHORT — по ASK (серверная цена BingX).",
         parse_mode=ParseMode.HTML,
@@ -639,8 +648,8 @@ async def cb_close_confirm(callback: CallbackQuery, session):
         side_tag = TG_LONG if closed.side == "LONG" else TG_SHORT
         await callback.message.edit_text(
             f"{TG_CHECK} <b>ПОЗИЦИЯ ЗАКРЫТА</b>\n\n"
-            f"{closed.symbol} {side_tag} {closed.side}\n"
-            f"Выход: {fmt_money(closed.current_price)}\n"
+            f"{closed.symbol} {side_tag} {format_side(closed.side)}\n"
+            f"Выход: {fmt_price(closed.current_price)}\n"
             f"Реализованный PnL: {fmt_money(pnl)}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(

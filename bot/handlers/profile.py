@@ -30,7 +30,7 @@ from bot.emojis import (
     tg_emoji,
 )
 from bot.keyboards import contact_keyboard
-from bot.views import fmt_money, fmt_pct, main_menu
+from bot.views import fmt_money, fmt_pct, fmt_price, format_side, main_menu
 from db.models import User
 from db.paper_models import PaperPosition, PositionStatus, TradingAccount
 from services.accounts import get_or_create_user, verify_phone
@@ -267,7 +267,7 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
             *[
                 [
                     InlineKeyboardButton(
-                        text=f"Закрыть {p.symbol} {p.side}",
+                        text=f"Закрыть {p.symbol} {format_side(p.side)}",
                         callback_data=f"close_preview:{p.id}",
                         icon_custom_emoji_id=RED_ID,
                     )
@@ -280,7 +280,8 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
     )
     lines = [f"{TG_CHART} <b>МОИ СДЕЛКИ</b>\n"]
     for p in positions:
-        side_tag = TG_LONG if p.side == "LONG" else TG_SHORT
+        side_str = format_side(p.side)
+        side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         if p.status == PositionStatus.OPEN.value:
             pnl_line = f"PnL: {fmt_money(p.unrealized_pnl)}"
             status_line = f"{tg_emoji(GREEN_ID, '🟢')} ОТКРЫТА"
@@ -288,8 +289,8 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
             pnl_line = f"PnL: {fmt_money(p.realized_pnl)}"
             status_line = f"{tg_emoji(CROSS_ID, '❌')} ЗАКРЫТА"
         lines.append(
-            f"{p.symbol} {side_tag} {p.side} x{p.leverage or 1:g}\n"
-            f"Вход: {fmt_money(p.entry_price)} → Выход: {fmt_money(p.current_price)}\n"
+            f"{p.symbol} {side_tag} {side_str} x{p.leverage or 1:g}\n"
+            f"Вход: {fmt_price(p.entry_price)} → Выход: {fmt_price(p.current_price)}\n"
             f"{pnl_line} | {status_line}"
         )
     await chat_target.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=open_keyboard)

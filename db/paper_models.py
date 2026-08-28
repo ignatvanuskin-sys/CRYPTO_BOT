@@ -73,6 +73,7 @@ class Instrument(Base):
     quantity_precision: Mapped[int] = mapped_column(Integer, default=6, nullable=False)
     min_quantity: Mapped[Decimal] = mapped_column(Numeric(30, 12), default=Decimal("0.000001"), nullable=False)
     max_quantity: Mapped[Decimal | None] = mapped_column(Numeric(30, 12), nullable=True)
+    max_leverage: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 class AccountLedger(Base):

@@ -146,8 +146,10 @@ async def open_position(
         raise PaperError("Side must be LONG/SHORT")
 
     leverage = Decimal(str(leverage))
-    if not leverage.is_finite() or leverage < 1 or leverage > 20:
-        raise PaperError("Leverage must be a finite number between 1 and 20")
+    if not leverage.is_finite() or leverage < 1 or leverage > 300:
+        raise PaperError("Leverage must be a finite number between 1 and 300")
+    # Per-instrument cap (if instrument has max_leverage, enforce it)
+    # Note: instrument is fetched later; we will re-check after instrument lookup
 
     # instrument
     inst = await session.get(Instrument, symbol)
@@ -207,6 +209,10 @@ async def open_position(
         raise InvalidQuantity(f"Quantity < min {inst.min_quantity}")
     if inst.max_quantity and quantity > inst.max_quantity:
         raise InvalidQuantity(f"Quantity > max {inst.max_quantity}")
+    # Per-instrument max leverage (enforces real BingX tiers)
+    max_lev = getattr(inst, "max_leverage", None)
+    if max_lev is not None and leverage > Decimal(str(max_lev)):
+        raise PaperError(f"Max leverage for {symbol} is {max_lev}x")
 
     _validate_tp_sl(side, executed_price, take_profit, stop_loss)
 

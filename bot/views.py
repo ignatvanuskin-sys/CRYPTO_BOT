@@ -39,6 +39,46 @@ def fmt_money(value: Decimal | int | float | None) -> str:
     return f"${Decimal(str(value)):,.2f}"
 
 
+def fmt_price(value: Decimal | int | float | None, precision: int | None = None) -> str:
+    if value is None:
+        return "—"
+    d = Decimal(str(value))
+    if precision is not None:
+        quant = Decimal(10) ** -int(precision)
+        try:
+            return f"${d.quantize(quant):,f}"
+        except Exception:
+            pass
+    # Auto precision based on magnitude — makes low-price coins readable
+    abs_d = abs(d)
+    if abs_d == 0:
+        return "$0.00"
+    if abs_d >= 1000:
+        quant = Decimal("0.01")
+    elif abs_d >= 1:
+        quant = Decimal("0.0001")
+    elif abs_d >= 0.1:
+        quant = Decimal("0.000001")
+    else:
+        quant = Decimal("0.00000001")
+    try:
+        return f"${d.quantize(quant):,f}"
+    except Exception:
+        return f"${d:,.8f}".rstrip("0").rstrip(".")
+
+
+def format_side(side) -> str:
+    """Enum or string → 'LONG'/'SHORT'."""
+    if side is None:
+        return "—"
+    if hasattr(side, "value"):
+        return str(side.value)
+    txt = str(side)
+    if "." in txt:
+        return txt.split(".")[-1]
+    return txt
+
+
 def fmt_pct(value: Decimal | int | float | None) -> str:
     if value is None:
         return "—"
