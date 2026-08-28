@@ -107,6 +107,26 @@ async def main() -> None:
         dp.include_router(trade_router)
         dp.include_router(admin_router)
 
+        # Устанавливаем русскоязычные команды с описаниями (видны при вводе "/")
+        try:
+            from aiogram.types import BotCommand
+
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="start", description="Запуск и верификация номера"),
+                    BotCommand(command="профиль", description="Личный кабинет — баланс, ROE, место"),
+                    BotCommand(command="сделки", description="Активные сделки"),
+                    BotCommand(command="история", description="Все сделки — статистика закрытых"),
+                    BotCommand(command="все_сделки", description="Все сделки и статистика"),
+                    BotCommand(command="торговать", description="Торговля — выбор монеты и открытие"),
+                    BotCommand(command="топ", description="Топ-10 лидеров недели"),
+                    BotCommand(command="позиции", description="Открытые позиции"),
+                    BotCommand(command="активные", description="Активные сделки"),
+                ]
+            )
+        except Exception as e:
+            logger.warning("Не удалось установить команды бота: %s", e)
+
         # Background tasks inside the SAME process and event loop:
         # price poller, TP/SL engine, competition lifecycle.
         background_tasks = [

@@ -178,6 +178,9 @@ async def _account_line(session, user: User) -> str:
 
 
 @router.message(Command("trade"))
+@router.message(Command("торговать"))
+@router.message(Command("torgovat"))
+@router.message(Command("trade_ru"))
 @router.message(F.text == "Торговать")
 async def cmd_trade(message: Message, session):
     await message.answer(

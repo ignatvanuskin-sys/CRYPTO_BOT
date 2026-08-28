@@ -143,8 +143,11 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
 
 
 @router.message(Command("top"))
+@router.message(Command("топ"))
 @router.message(Command("leaderboard"))
 @router.message(Command("leaders"))
+@router.message(Command("лидеры"))
+@router.message(Command("таблица_лидеров"))
 @router.message(F.text.in_({"Топ", "Топ 10", "Лидеры", "Таблица лидеров", "🏆 Топ 10", "🏆 Топ"}))
 async def cmd_top(message: Message, session):
     if message.from_user is None:
@@ -210,6 +213,9 @@ async def cmd_top(message: Message, session):
 
 
 @router.message(Command("positions"))
+@router.message(Command("позиции"))
+@router.message(Command("pozicii"))
+@router.message(Command("открытые"))
 @router.message(F.text.in_({"Позиции", "Открытые позиции", "Мои позиции"}))
 async def cmd_positions(message: Message, session):
     if message.from_user is None:
