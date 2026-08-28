@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 from aiogram import F, Router
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
+from bot.emojis import (
+    CHART_ID,
+    CHART_UP_ID,
+    CHECK_ID,
+    CROWN_ID,
+    CROSS_ID,
+    GREEN_ID,
+    MONEY_ID,
+    PARTY_ID,
+    PIN_ID,
+    RED_ID,
+    STAR_ID,
+    tg_emoji,
+    TG_LONG,
+    TG_SHORT,
+)
 from bot.keyboards import contact_keyboard
 from bot.views import fmt_money, fmt_pct, main_menu
 from db.models import User
@@ -15,6 +32,12 @@ from services.leaderboard import get_user_rank
 from services.trading_account import get_or_create_trading_account
 
 router = Router()
+
+# Premium tags for messages
+TG_PARTY = tg_emoji(PARTY_ID, "🎉")
+TG_CHECK = tg_emoji(CHECK_ID, "✔️")
+TG_CROWN = tg_emoji(CROWN_ID, "👑")
+TG_STAR = tg_emoji(STAR_ID, "⭐️")
 
 
 async def _get_user_by_telegram_id(session, telegram_id: int) -> User | None:
@@ -52,8 +75,8 @@ async def cmd_start(message: Message, session):
     if user.phone_verified_at is None:
         await session.commit()
         await message.answer(
-            "Привет! Это демо-тренажёр криптотрейдинга с реальными ценами BingX.\n\n"
-            "Для старта подтвердите номер телефона — на него будет записан демо-баланс $10 000.",
+            f"Привет! Это демо-тренажёр криптотрейдинга с реальными ценами BingX.\n\n"
+            f"Для старта подтвердите номер телефона — на него будет записан демо-баланс $10 000.",
             reply_markup=contact_keyboard(),
         )
         return
@@ -61,14 +84,13 @@ async def cmd_start(message: Message, session):
     await _grant_demo_balance(session, user)
     await _ensure_competition(session, user)
     await session.commit()
-    text = (
-        "🎉 Добро пожаловать!"
-        if is_new
-        else "С возвращением!"
-    )
+    welcome = f"{TG_PARTY} Добро пожаловать!" if is_new else "С возвращением!"
     await send_main_menu(
         message,
-        f"{text}\n\nДемо-баланс: $10 000\n\n🚀 «Торговать» — открыть сделку\n👤 «Личный кабинет» — баланс, сделки, рейтинг",
+        f"{welcome}\n\n"
+        f"{TG_MONEY} Демо-баланс: $10 000\n\n"
+        f"{tg_emoji(CHART_UP_ID, '📈')} <b>Торговать</b> — открыть сделку\n"
+        f"{TG_CROWN} <b>Личный кабинет</b> — баланс, сделки, рейтинг",
     )
 
 
@@ -102,14 +124,15 @@ async def handle_contact(message: Message, session):
 
     await send_main_menu(
         message,
-        f"✅ Номер подтверждён: {contact.phone_number}\n\n"
-        f"💰 Демо-баланс начислен: {fmt_money(account.initial_balance)}\n\n"
-        "🚀 «Торговать» — открыть сделку\n👤 «Личный кабинет» — баланс, сделки, рейтинг",
+        f"{TG_CHECK} Номер подтверждён: {contact.phone_number}\n\n"
+        f"{TG_MONEY} Демо-баланс начислен: {fmt_money(account.initial_balance)}\n\n"
+        f"{tg_emoji(CHART_UP_ID, '📈')} <b>Торговать</b> — открыть сделку\n"
+        f"{TG_CROWN} <b>Личный кабинет</b> — баланс, сделки, рейтинг",
     )
 
 
 @router.message(Command("profile"))
-@router.message(F.text == "👤 Личный кабинет")
+@router.message(F.text == "Личный кабинет")
 async def cmd_profile(message: Message, session):
     user = await _get_user_by_telegram_id(session, message.from_user.id)
     if not user:
@@ -138,28 +161,29 @@ async def cmd_profile(message: Message, session):
     roe = fmt_pct(rank_info["roi"]) if rank_info else "+0.00%"
 
     text = (
-        "👤 ЛИЧНЫЙ КАБИНЕТ\n\n"
-        f"Юзернейм: {user.username or user.telegram_id}\n"
-        f"💰 Баланс: {fmt_money(account.equity)}\n\n"
-        "📊 СДЕЛКИ\n"
+        f"{TG_CROWN} <b>ЛИЧНЫЙ КАБИНЕТ</b>\n\n"
+        f"{tg_emoji(PIN_ID, '📌')} Юзернейм: {user.username or user.telegram_id}\n"
+        f"{TG_MONEY} Баланс: {fmt_money(account.equity)}\n\n"
+        f"{TG_CHART} <b>СДЕЛКИ</b>\n"
         f"Успешных: {wins}\n"
         f"Неуспешных: {losses}\n\n"
-        f"📈 Общий ROE: {roe}\n"
-        f"🏆 Место в рейтинге: {rank}"
+        f"{tg_emoji(CHART_UP_ID, '📈')} Общий ROE: {roe}\n"
+        f"{TG_STAR} Место в рейтинге: {rank}"
     )
     await message.answer(
         text,
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="📜 Сделки", callback_data="nav:transactions")],
-                [InlineKeyboardButton(text="🚀 Торговать", callback_data="nav:trade")],
+                [InlineKeyboardButton(text="Сделки", callback_data="nav:transactions", icon_custom_emoji_id=CHART_ID)],
+                [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
             ]
         ),
     )
 
 
 @router.message(Command("transactions"))
-@router.message(F.text == "📜 Сделки")
+@router.message(F.text == "Сделки")
 async def cmd_transactions(message: Message, session):
     user = await _get_user_by_telegram_id(session, message.from_user.id)
     if not user:
@@ -169,7 +193,7 @@ async def cmd_transactions(message: Message, session):
         await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
     ).scalar_one_or_none()
     if not account:
-        await message.answer("Сделок пока нет. Нажмите 🚀 Торговать.", reply_markup=main_menu())
+        await message.answer("Сделок пока нет. Нажмите Торговать.", reply_markup=main_menu())
         return
     positions = (
         await session.execute(
@@ -181,7 +205,8 @@ async def cmd_transactions(message: Message, session):
     ).scalars().all()
     if not positions:
         await message.answer(
-            "📜 МОИ СДЕЛКИ\n\nСделок пока нет.\n\nНажмите 🚀 Торговать, чтобы открыть первую.",
+            f"{TG_CHART} <b>МОИ СДЕЛКИ</b>\n\nСделок пока нет.\n\nНажмите Торговать, чтобы открыть первую.",
+            parse_mode=ParseMode.HTML,
             reply_markup=main_menu(),
         )
         return
@@ -191,30 +216,32 @@ async def cmd_transactions(message: Message, session):
             *[
                 [
                     InlineKeyboardButton(
-                        text=f"🔴 Закрыть {p.symbol} {p.side}",
+                        text=f"Закрыть {p.symbol} {p.side}",
                         callback_data=f"close_preview:{p.id}",
+                        icon_custom_emoji_id=RED_ID,
                     )
                 ]
                 for p in positions
                 if p.status == PositionStatus.OPEN.value
             ],
-            [InlineKeyboardButton(text="🚀 Торговать", callback_data="nav:trade")],
+            [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
         ]
     )
-    lines = ["📜 МОИ СДЕЛКИ\n"]
+    lines = [f"{TG_CHART} <b>МОИ СДЕЛКИ</b>\n"]
     for p in positions:
+        side_tag = TG_LONG if p.side == "LONG" else TG_SHORT
         if p.status == PositionStatus.OPEN.value:
             pnl_line = f"PnL: {fmt_money(p.unrealized_pnl)}"
-            status_line = "🟢 ОТКРЫТА"
+            status_line = f"{tg_emoji(GREEN_ID, '🟢')} ОТКРЫТА"
         else:
             pnl_line = f"PnL: {fmt_money(p.realized_pnl)}"
-            status_line = "⚪️ ЗАКРЫТА"
+            status_line = f"{tg_emoji(CROSS_ID, '❌')} ЗАКРЫТА"
         lines.append(
-            f"{p.symbol} {'🔼 LONG' if p.side == 'LONG' else '🔽 SHORT'} x{p.leverage or 1:g}\n"
+            f"{p.symbol} {side_tag} {p.side} x{p.leverage or 1:g}\n"
             f"Вход: {fmt_money(p.entry_price)} → Выход: {fmt_money(p.current_price)}\n"
             f"{pnl_line} | {status_line}"
         )
-    await message.answer("\n\n".join(lines), reply_markup=open_keyboard)
+    await message.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=open_keyboard)
 
 
 @router.callback_query(F.data == "nav:home")

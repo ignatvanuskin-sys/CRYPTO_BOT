@@ -4,6 +4,8 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bot.handlers.admin import router as admin_router
@@ -32,7 +34,7 @@ async def main() -> None:
 
     engine = create_async_engine(settings.database_url_async, echo=False)
     lock_connection = None
-    bot = Bot(token=settings.bot_token)
+    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     background_tasks: list[asyncio.Task] = []
     try:
         lock_connection = await acquire_advisory_lock(engine, LOCK_KEY, "bot (single process)")
