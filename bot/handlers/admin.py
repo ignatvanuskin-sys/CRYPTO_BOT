@@ -1,19 +1,17 @@
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram import Router
 from aiogram.filters import Command
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
-from db.models import User, Week, LeaderboardSnapshot, Prize
-from db.competition_models import Competition, CompetitionStatus
-from db.paper_models import PaperPosition
+from aiogram.types import Message
+from sqlalchemy import func, select
+
 from config import settings
+from db.competition_models import Competition, CompetitionStatus
+from db.models import User
+from db.paper_models import PaperPosition
 from services.competition import finish_competition
 from services.demo import create_demo_cup, seed_demo_players
 from services.leaderboard import build_leaderboard
 from services.metrics import increment, snapshot as metrics_snapshot
 from services.notifications import notify_competition_finished
-from services.weekly_cycle import close_week, get_or_create_active_week
-from decimal import Decimal
 
 router = Router()
 
@@ -21,36 +19,16 @@ def is_admin(telegram_id: int) -> bool:
     return telegram_id in settings.admin_ids_set
 
 @router.message(Command("admin_stats"))
-async def admin_stats(message: Message, session: AsyncSession):
+async def admin_stats(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     user_count = (await session.execute(select(func.count()).select_from(User))).scalar_one()
-    week_res = await session.execute(select(Week).order_by(Week.id.desc()).limit(1))
-    week = week_res.scalar_one_or_none()
-    await message.answer(f"Users: {user_count}\nActive week: {week.id if week else 'none'} status {week.status if week else ''}")
-
-@router.message(Command("admin_review_top"))
-async def admin_review_top(message: Message, session: AsyncSession):
-    if settings.trading_mode == "paper":
-        await message.answer("В paper-режиме используй /top и /admin_reconcile.")
-        return
-    if not is_admin(message.from_user.id):
-        await message.answer("Нет доступа")
-        return
-    week_res = await session.execute(select(Week).order_by(Week.id.desc()).limit(1))
-    week = week_res.scalar_one_or_none()
-    if not week:
-        await message.answer("Нет недели")
-        return
-    snap_res = await session.execute(select(LeaderboardSnapshot, User).join(User, LeaderboardSnapshot.user_id == User.id).where(LeaderboardSnapshot.week_id == week.id).order_by(LeaderboardSnapshot.rank).limit(settings.prize_top_n))
-    lines = []
-    for snap, user in snap_res.all():
-        lines.append(f"{snap.rank}. {user.username} phone {user.phone_number} equity {snap.total_equity} cash {snap.cash_balance}")
-    await message.answer("\n".join(lines) if lines else "Топ пуст")
+    instrument_count = (await session.execute(select(func.count()).select_from(PaperPosition))).scalar_one()
+    await message.answer(f"Users: {user_count}\nPaper positions rows: {instrument_count}")
 
 @router.message(Command("admin_ban"))
-async def admin_ban(message: Message, session: AsyncSession):
+async def admin_ban(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
@@ -60,7 +38,7 @@ async def admin_ban(message: Message, session: AsyncSession):
         return
     try:
         tid = int(parts[1])
-    except:
+    except ValueError:
         await message.answer("Неверный telegram_id")
         return
     reason = parts[2] if len(parts) > 2 else "admin ban"
@@ -74,40 +52,27 @@ async def admin_ban(message: Message, session: AsyncSession):
     await session.commit()
     await message.answer(f"Забанен {tid}")
 
-@router.message(Command("admin_force_close_week"))
-async def admin_force_close(message: Message):
-    if settings.trading_mode == "paper":
-        await message.answer("В paper-режиме эта legacy-команда отключена.")
-        return
+@router.message(Command("admin_unban"))
+async def admin_unban(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
-    from bot.keyboards import force_close_confirm
-    await message.answer("Точно закрыть неделю? Это идемпотентно.", reply_markup=force_close_confirm())
-
-@router.callback_query(F.data == "force_close_confirm")
-async def cb_force_close_confirm(callback: CallbackQuery, session: AsyncSession):
-    if settings.trading_mode == "paper":
-        await callback.answer("Legacy-команда отключена в paper-режиме", show_alert=True)
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip().lstrip("-").isdigit():
+        await message.answer("Использование: /admin_unban <telegram_id>")
         return
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа")
+    telegram_id = int(parts[1])
+    user = (await session.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+    if not user:
+        await message.answer("Пользователь не найден")
         return
-    async with session.begin():
-        week = await get_or_create_active_week(session)
-        await close_week(session, week, prize_top_n=settings.prize_top_n, grant_amount=Decimal(settings.weekly_grant_amount))
+    user.is_banned = False
+    user.ban_reason = None
     await session.commit()
-    await callback.message.answer("Неделя закрыта")
-    await callback.answer("OK")
-
-@router.callback_query(F.data == "force_close_cancel")
-async def cb_force_close_cancel(callback: CallbackQuery):
-    await callback.answer("Отменено")
-    await callback.message.answer("Отменено")
-
+    await message.answer(f"✅ Пользователь {telegram_id} разблокирован")
 
 @router.message(Command("admin_active_competition"))
-async def admin_active_competition(message: Message, session: AsyncSession):
+async def admin_active_competition(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
@@ -127,9 +92,8 @@ async def admin_active_competition(message: Message, session: AsyncSession):
         f"Баланс: ${competition.initial_balance}\nПризы: ${competition.prize_pool}"
     )
 
-
 @router.message(Command("admin_create_demo_cup"))
-async def admin_create_demo_cup(message: Message, session: AsyncSession):
+async def admin_create_demo_cup(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
@@ -145,13 +109,12 @@ async def admin_create_demo_cup(message: Message, session: AsyncSession):
         return
     await message.answer(
         f"✅ DEMO TRADING CUP готов\nID: {competition.id}\n"
-        f"Баланс: $10,000\nПризовой фонд: ${competition.prize_pool}\n"
-        f"Длительность: 24ч\nАктивы: BTC, ETH, SOL\nРейтинг: ROI"
+        f"Баланс: ${competition.initial_balance}\nПризовой фонд: ${competition.prize_pool}\n"
+        f"Длительность: {settings.demo_cup_duration_hours}ч\nРейтинг: ROI"
     )
 
-
 @router.message(Command("admin_seed_demo_players"))
-async def admin_seed_demo_players(message: Message, session: AsyncSession):
+async def admin_seed_demo_players(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
@@ -179,9 +142,8 @@ async def admin_seed_demo_players(message: Message, session: AsyncSession):
     await session.commit()
     await message.answer(f"✅ Симулированные игроки готовы: создано новых {created}.\nМетки: 🤖 DEMO_01 …")
 
-
 @router.message(Command("admin_reconcile"))
-async def admin_reconcile(message: Message, session: AsyncSession):
+async def admin_reconcile(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
@@ -199,9 +161,9 @@ async def admin_reconcile(message: Message, session: AsyncSession):
     await session.commit()
     await message.answer(f"✅ Рейтинг пересчитан. Участников: {len(leaderboard)}")
 
-
 @router.message(Command("admin_finish_competition"))
-async def admin_finish_competition(message: Message, session: AsyncSession):
+async def admin_finish_competition(message: Message, session):
+    """Ручной триггер завершения турнира (фолбэк к фоновой задаче lifecycle)."""
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
@@ -227,9 +189,8 @@ async def admin_finish_competition(message: Message, session: AsyncSession):
         return
     await message.answer("✅ Турнир завершён и рейтинг/призы зафиксированы." if finished else "Турнир уже завершён.")
 
-
 @router.message(Command("admin_product_stats"))
-async def admin_product_stats(message: Message, session: AsyncSession):
+async def admin_product_stats(message: Message, session):
     if not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
@@ -243,23 +204,3 @@ async def admin_product_stats(message: Message, session: AsyncSession):
         "Runtime metrics (сбрасываются после restart):\n"
         f"{metric_lines}"
     )
-
-
-@router.message(Command("admin_unban"))
-async def admin_unban(message: Message, session: AsyncSession):
-    if not is_admin(message.from_user.id):
-        await message.answer("Нет доступа")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].strip().lstrip("-").isdigit():
-        await message.answer("Использование: /admin_unban <telegram_id>")
-        return
-    telegram_id = int(parts[1])
-    user = (await session.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
-    if not user:
-        await message.answer("Пользователь не найден")
-        return
-    user.is_banned = False
-    user.ban_reason = None
-    await session.commit()
-    await message.answer(f"✅ Пользователь {telegram_id} разблокирован")

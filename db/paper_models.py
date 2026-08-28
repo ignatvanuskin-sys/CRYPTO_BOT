@@ -122,6 +122,7 @@ class PaperPosition(Base):
     entry_price: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
     current_price: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
     notional: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    leverage: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=Decimal("1"))
     take_profit: Mapped[Decimal | None] = mapped_column(Numeric(30, 12), nullable=True)
     stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(30, 12), nullable=True)
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))

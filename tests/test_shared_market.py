@@ -28,11 +28,11 @@ from services.bingx_market_data import (
     PriceSnapshot,
     get_execution_snapshot,
     persist_snapshot,
+    update_snapshot,
     validate_snapshot,
 )
 from services.competition import finish_competition, join_competition
 from services.paper_adapter import PaperError, close_position, open_position
-from services.pricing import price_cache
 from services.trading_account import get_or_create_trading_account
 from workers.competition_lifecycle import finalize_competition_session
 
@@ -77,7 +77,7 @@ async def test_shared_snapshot_is_source_of_truth_not_local_cache(session):
         PriceSnapshot("BTCUSDT", Decimal("50000"), Decimal("50010"), Decimal("50005"), now, now),
     )
     # A different (wrong) value sits in the process-local cache — must be ignored.
-    price_cache.update("BTCUSDT", Decimal("99999"), now)
+    update_snapshot(PriceSnapshot("BTCUSDT", Decimal("99999"), Decimal("99999"), Decimal("99999"), now, now))
     await session.commit()
 
     position = await open_position(
@@ -97,7 +97,6 @@ async def test_shared_snapshot_is_source_of_truth_not_local_cache(session):
 async def test_no_execution_without_shared_snapshot(session):
     account, competition, now = await _setup_paper(session)
     # Neither DB snapshot nor local cache contains BTCUSDT.
-    price_cache.clear()
     await session.commit()
     with pytest.raises(PaperError):
         await open_position(

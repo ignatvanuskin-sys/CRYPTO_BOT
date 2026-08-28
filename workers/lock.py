@@ -4,8 +4,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 # PostgreSQL advisory locks are connection-scoped; keep the connection open.
-WORKER_LOCK_KEY = 82463517
-BOT_LOCK_KEY = 82463518
+# One process (bot + its background tasks) holds one lock.
+LOCK_KEY = 82463518
 
 
 async def acquire_advisory_lock(engine: AsyncEngine, lock_key: int, owner: str) -> AsyncConnection | None:
@@ -32,11 +32,3 @@ async def release_advisory_lock(connection: AsyncConnection | None, lock_key: in
         )
     finally:
         await connection.close()
-
-
-async def acquire_worker_lock(engine: AsyncEngine) -> AsyncConnection | None:
-    return await acquire_advisory_lock(engine, WORKER_LOCK_KEY, "worker")
-
-
-async def release_worker_lock(connection: AsyncConnection | None) -> None:
-    await release_advisory_lock(connection, WORKER_LOCK_KEY)

@@ -89,6 +89,7 @@ async def open_position(
     notional: Decimal | None = None,
     competition_id: int | None = None,
     requested_at: datetime | None = None,
+    leverage: Decimal | int = Decimal("1"),
 ) -> PaperPosition:
     if not idempotency_key:
         raise PaperError("Idempotency-Key required")
@@ -143,6 +144,10 @@ async def open_position(
     side = side.strip().upper()
     if side not in ("LONG", "SHORT"):
         raise PaperError("Side must be LONG/SHORT")
+
+    leverage = Decimal(str(leverage))
+    if not leverage.is_finite() or leverage < 1:
+        raise PaperError("Leverage must be a finite number >= 1")
 
     # instrument
     inst = await session.get(Instrument, symbol)
@@ -226,8 +231,9 @@ async def open_position(
         return existing_position
 
     notional = calc_notional(executed_price, quantity)
-    # margin check: required = notional (no leverage)
-    if notional > account.available_margin:
+    # margin check: required margin = notional / leverage
+    required_margin = (notional / leverage).quantize(Decimal("0.01"))
+    if required_margin > account.available_margin:
         try:
             async with session.begin_nested():
                 order = PaperOrder(
@@ -245,7 +251,7 @@ async def open_position(
                 await session.flush()
         except IntegrityError:
             return await _resolve_idempotent_position(session, idempotency_key, account, symbol, side)
-        raise InsufficientMargin(f"Need {notional}, available {account.available_margin}")
+        raise InsufficientMargin(f"Need {required_margin}, available {account.available_margin}")
 
     # create order + position (with competition_id). The inserts run inside a
     # savepoint so a concurrent duplicate idempotency key collapses to the
@@ -276,6 +282,7 @@ async def open_position(
                 entry_price=executed_price,
                 current_price=executed_price,
                 notional=notional,
+                leverage=leverage,
                 take_profit=take_profit,
                 stop_loss=stop_loss,
                 unrealized_pnl=Decimal("0"),
@@ -324,16 +331,16 @@ async def open_position(
     except IntegrityError:
         return await _resolve_idempotent_position(session, idempotency_key, account, symbol, side)
 
-    # Reserve the notional in the paper account. `refresh_account_stats`
+    # Reserve the required margin in the paper account. `refresh_account_stats`
     # reconciles equity and available margin from this state.
-    account.cash_balance = (account.cash_balance - notional).quantize(Decimal("0.01"))
-    account.margin_used = (account.margin_used + notional).quantize(Decimal("0.01"))
+    account.cash_balance = (account.cash_balance - required_margin).quantize(Decimal("0.01"))
+    account.margin_used = (account.margin_used + required_margin).quantize(Decimal("0.01"))
 
     # ledger
     ledger = AccountLedger(
         account_id=account.id,
         type=LedgerType.TRADE_OPEN.value,
-        amount=-notional,
+        amount=-required_margin,
         balance_after=account.cash_balance,
         reference_type="position",
         reference_id=str(position.id),
@@ -470,11 +477,13 @@ async def close_position(
         session.add(execution)
         await session.flush()
 
-    # ledger: return notional + pnl
-    # cash was deducted at open by notional, now we return notional + pnl
-    return_amount = (position.notional + net).quantize(Decimal("0.01"))
+    # ledger: return margin + pnl
+    # cash was deducted at open by the required margin (notional / leverage),
+    # now we return that margin plus the realized PnL.
+    returned_margin = (position.notional / Decimal(str(position.leverage or 1))).quantize(Decimal("0.01"))
+    return_amount = (returned_margin + net).quantize(Decimal("0.01"))
     account.cash_balance = (account.cash_balance + return_amount).quantize(Decimal("0.01"))
-    account.margin_used = (account.margin_used - position.notional).quantize(Decimal("0.01"))
+    account.margin_used = (account.margin_used - returned_margin).quantize(Decimal("0.01"))
     if account.margin_used < 0:
         account.margin_used = Decimal("0")
     account.realized_pnl = (account.realized_pnl + net).quantize(Decimal("0.01"))

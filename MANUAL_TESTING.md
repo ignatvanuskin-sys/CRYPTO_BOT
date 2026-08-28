@@ -1,56 +1,54 @@
-# Ручная проверка (фактические результаты, 2026-08-27)
+# MANUAL TESTING — единый демо-сценарий (paper trading, один сервис bot/main.py)
 
-## 1. Ценовой фид BingX (live, ccxt)
+Архитектура после отката: **один Railway-сервис** = процесс `python -m bot.main`.
+`price_poller`, `tp_sl_engine`, `competition_lifecycle` — фоновые asyncio-таски
+в том же процессе (`asyncio.create_task`), та же PostgreSQL advisory-блокировка
+(`workers/lock.py:LOCK_KEY`). Легаси TradeWeek-контур удалён из ветки `main`
+(снапшот сохранён в ветке `legacy/tradeweek-snapshot`).
 
-**Команда:**
+## 1. Локальный прогон тестов
+
 ```bash
-python -c "import ccxt.async_support as ccxt; ..."
+pip install -r requirements.txt
+pytest -q
 ```
 
-**Результаты (2026-08-27, UTC):**
-- `load_markets()` → **3390** маркетов.
-- `fetch_tickers()` → **714** тикеров spot.
-- Примеры (сверено с UI BingX в тот же момент):
-  - `BTC/USDT` last = **78795.45**, quoteVolume ≈ 148M
-  - `ETH/USDT` last = **2490.75**, quoteVolume ≈ 85M
-  - `XRP/USDT`, `BNB/USDT`, `USDC/USDT` — присутствуют в первых 5 ключах.
-- Синхронизация `assets`:
-  - Запуск `python -m workers.price_poller` (с `DATABASE_URL` на PG) — лог `Assets sync complete`, далее каждые ~2с батч.
-  - Проверка `SELECT count(*) FROM assets` после sync — **>700** строк (spot/active).
-  - `last_24h_quote_volume` заполнено для `BTC-USDT`, `is_quote_eligible` = true при `MIN_24H_QUOTE_VOLUME_USDT=1000000` (т.к. 148M > 1M).
+Покрыто автотестами: ASK/BID-правила, Decimal-деньги, идемпотентность open/close,
+гонки на реальном PG (`test_paper_race_pg.py`, скипается без Docker/TEST_DATABASE_URL),
+плечо (маржа = бюджет), отказ при insufficient margin, идемпотентный демо-грант,
+отказ исполнения без/с протухшим shared snapshot.
 
-**Отказоустойчивость:**
-- Имитация: `ex.fetch_tickers = AsyncMock(side_effect=Exception("timeout"))` → `fetch_once()` делает 3 ретрая с backoff 0.5s/1.0s/2.0s, логи `price poll attempt 1/3 failed: timeout`.
-- После 5 последовательных `fetch_once()` с ошибкой → `consecutive_failures=5`, `last_alert_at` выставлен, лог `ALERT: BingX unavailable 5 polls in a row — prices stale`.
-- При этом `price_cache` не обновляется → `is_stale("BTC-USDT")==True` через `MAX_PRICE_STALENESS_SECONDS=3`, ордера отклоняются с `PriceStale` (проверено `test_price_poller_resilience`).
-- При восстановлении (`fetch_tickers.return_value = {"BTC/USDT": {"last":51000}}`) → `consecutive_failures` сбрасывается в 0, кэш свежий.
+## 2. Локальный запуск (optional, sqlite без блокировок)
 
-**Недоступность фида (ручной):**
-- Отключить интернет → `fetch_tickers` exception, воркер не падает (while True + try), ордера `/buy BTC-USDT 100` → ответ `Цена устарела: Price for BTC-USDT is stale`.
+```bash
+export BOT_TOKEN=...            # тестовый бот из BotFather
+python -m bot.main              # предупреждение про singleton lock — ожидаемо
+```
 
-## 2. Telegram-бот (live, aiogram)
+## 3. Railway (прод-приёмка)
 
-- `BOT_TOKEN` тестовый (BotFather), `DATABASE_URL` на локальный Postgres 15, `alembic upgrade head` — все таблицы созданы, partial index `uq_weekly_grant` присутствует (`\d transactions`).
-- `python -m bot.main` — поллинг стартовал.
-- Проверено вручную (тестовый аккаунт 123456789):
-  - `/start` → кнопки `request_contact` + `accept_rules`; без `rules_accepted_at` → `/buy` отклоняет `Rules acceptance required` (сервисный слой).
-  - Без шаринга номера → `/buy BTC-USDT 100` → `Phone verification required` (`services/accounts.py:42`).
-  - После `request_contact` → `phone_verified_at` + `WEEKLY_GRANT 10000` начислен сразу (mid-week gap fix) — проверено `SELECT * FROM transactions WHERE type='WEEKLY_GRANT'`.
-  - `/price BTC-USDT` → `BTC-USDT: 78795.45 (обновлено 0.8с назад)` — совпадает с BingX.
-  - `/buy BTC-USDT 1000` → `Куплено ... qty 0.01269` (1000/78795.45), `/portfolio` показывает позицию, `/sell BTC-USDT all` → qty 0.
-  - `/balance` → `Баланс: 9000.00`, `/leaderboard` live считает `cash + eligible positions`.
-  - Админ `ADMIN_TELEGRAM_IDS=123456789` → `/admin_stats` Users: N, `/admin_review_top` список, `/admin_force_close_week` → двухшаговое `Да, точно закрыть` → неделя `closing→closed`, снапшоты созданы, новая неделя `week_number+1`.
+Deploy = текущая ветка `main`. Start-команда (nixpacks.toml):
+`alembic upgrade head && python -m bot.main`.
+Проверка деплоя по логам:
 
-## 3. Еженедельный цикл (live)
+- `Single-process bot starting: polling + price poller + TP/SL + competition lifecycle`
+- Отсутствие ошибок advisory lock (`Another bot process already holds...`)
+- Запись котировок: `SELECT symbol, bid, ask, exchange_timestamp FROM market_snapshots ORDER BY updated_at DESC;` — timestamps свежие каждые ~2с.
 
-- Ручной `close_week` на неделе с 3 юзерами и сделками → снапшоты `rank` по `total_equity`, `positions qty=0` после `FORCED_CLOSE`, гранты на новой неделе ровно по 1 на юзера.
-- Повторный `close_week` — no-op (идемпотентно), проверено `SELECT count(*) FROM leaderboard_snapshots` не растёт.
+## 4. Сквозной сценарий (обязательная приёмка, на задеплоенном боте)
 
-## 4. Инвариант сверки
+| # | Шаг | Ожидание |
+|---|-----|----------|
+| 1 | `/start` у нового юзера | Кнопка «Поделиться номером» (request_contact) |
+| 2 | Поделиться контактом | «Номер подтверждён», демо-баланс $10 000, reply-меню с «Личный кабинет» |
+| 3 | `/profile` | Юзернейм, баланс $10 000, 0 успешных / 0 неуспешных, ROE +0.00%, место в рейтинге |
+| 4 | `/trade` → «1️⃣ Выбрать монету» → `SOL` | Ссылка `https://bingx.com/en/perpetual/SOL-USDT`, ведёт на график пары |
+| 5 | `/trade` → «2️⃣ Быстрое открытие» → `SOL` → бюджет `100` → плечо `2x` → `LONG` → пропустить TP/SL → подтвердить | «Позиция открыта», вход по ASK |
+| 6 | `/transactions` | Открытая сделка видна, PnL обновляется от живых тиков BingX (переоткрыть экран через 10–30с) |
+| 7 | Закрытие вручную (или TP/SL) | LONG закрывается по BID, PnL зафиксирован |
+| 8 | `/profile` после закрытия | Счётчик сделок увеличен, ROE пересчитан |
+| 9 | Двойной клик по «✅ Подтвердить сделку» | Вторая позиция НЕ создаётся (in-flight защита + idempotency key) |
+| 10 | Повторить 5–7 для SHORT | SHORT открывается по BID, закрывается по ASK |
 
-- `verify_balances()` — внесена ручная порча `UPDATE transactions SET balance_after=999999 WHERE id=X` → следующий вызов вернул mismatch `(user_id, computed, stored)` — логируется как критичный алерт.
-
-## 5. Ограничения проверки
-
-- Docker/Postgres для `test_race_pg.py` недоступен на текущем Windows-хосте (Docker Desktop `pipe` не найден) — PG-тесты скипаются, но код готов к CI с Docker (testcontainers). Для подтверждения на PG нужен запуск в окружении с Docker (CI).
-- Реальная выплата призов не тестировалась — ручной процесс вне бота по ТЗ.
+Каждый пункт фиксируется скриншотом/логом реального диалога в Telegram
+с задеплоенным ботом (см. ACCEPTANCE_EVIDENCE.md).

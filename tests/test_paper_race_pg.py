@@ -17,8 +17,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from db.competition_models import Competition, CompetitionParticipant, LeaderboardSnapshot
 from db.models import User
 from db.paper_models import Instrument, PaperOrder, PaperPosition, TradingAccount
-from services.bingx_market_data import MarketDataUnavailable, PriceSnapshot, get_execution_snapshot, persist_snapshot
-from services.pricing import price_cache
+from services.bingx_market_data import (
+    MarketDataUnavailable,
+    PriceSnapshot,
+    get_execution_snapshot,
+    persist_snapshot,
+    update_snapshot,
+)
 from services.competition import finish_competition, join_competition
 from services.paper_adapter import PaperError, close_position, open_position
 from services.trading_account import get_or_create_trading_account
@@ -74,7 +79,9 @@ async def setup_paper(pg_engine):
 async def test_postgres_execution_never_falls_back_to_local_cache(pg_engine):
     await setup_paper(pg_engine)
     factory = async_sessionmaker(pg_engine, expire_on_commit=False)
-    price_cache.update("ETHUSDT", Decimal("3000"), datetime.now(timezone.utc))
+    now = datetime.now(timezone.utc)
+    # A snapshot exists only in the process-local cache — never in PostgreSQL.
+    update_snapshot(PriceSnapshot("ETHUSDT", Decimal("3000"), Decimal("3010"), Decimal("3005"), now, now))
     async with factory() as session:
         with pytest.raises(MarketDataUnavailable):
             await get_execution_snapshot(session, "ETHUSDT", 2000)
