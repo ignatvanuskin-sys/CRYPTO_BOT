@@ -9,34 +9,32 @@ from sqlalchemy import select
 from bot.emojis import (
     CHART_ID,
     CHART_UP_ID,
-    CHECK_ID,
-    CROWN_ID,
     CROSS_ID,
+    CROWN_ID,
     GREEN_ID,
     MONEY_ID,
     PARTY_ID,
     PIN_ID,
     RED_ID,
     STAR_ID,
-    tg_emoji,
+    TG_CHART,
+    TG_CHART_UP,
+    TG_CHECK,
+    TG_CROWN,
+    TG_GREEN,
     TG_LONG,
+    TG_MONEY,
+    TG_PARTY,
+    TG_RED,
     TG_SHORT,
+    tg_emoji,
 )
 from bot.keyboards import contact_keyboard
 from bot.views import fmt_money, fmt_pct, main_menu
-from db.models import User
-from db.paper_models import PaperPosition, PositionStatus, TradingAccount
-from services.accounts import get_or_create_user, verify_phone
-from services.competition import get_or_create_default_competition, join_competition
-from services.leaderboard import get_user_rank
-from services.trading_account import get_or_create_trading_account
 
 router = Router()
 
-# Premium tags for messages
-TG_PARTY = tg_emoji(PARTY_ID, "🎉")
-TG_CHECK = tg_emoji(CHECK_ID, "✔️")
-TG_CROWN = tg_emoji(CROWN_ID, "👑")
+# Local premium tag not in emojis.py
 TG_STAR = tg_emoji(STAR_ID, "⭐️")
 
 

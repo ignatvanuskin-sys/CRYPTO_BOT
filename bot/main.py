@@ -37,7 +37,16 @@ async def main() -> None:
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     background_tasks: list[asyncio.Task] = []
     try:
-        lock_connection = await acquire_advisory_lock(engine, LOCK_KEY, "bot (single process)")
+        # Retry lock acquisition during rolling deploys (old container still holds lock)
+        for attempt in range(15):
+            try:
+                lock_connection = await acquire_advisory_lock(engine, LOCK_KEY, "bot (single process)")
+                break
+            except RuntimeError as exc:
+                if attempt == 14:
+                    raise
+                logger.warning("Singleton lock held, retry %s/15: %s", attempt + 1, exc)
+                await asyncio.sleep(2)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         dp = Dispatcher()
 
