@@ -107,21 +107,24 @@ async def main() -> None:
         dp.include_router(trade_router)
         dp.include_router(admin_router)
 
-        # Устанавливаем русскоязычные команды с описаниями (видны при вводе "/")
+        # Устанавливаем команды с русскими описаниями (видны при вводе "/")
+        # Telegram требует command = a-z0-9_ (кириллица в имени команды невалидна → BOT_COMMAND_INVALID),
+        # поэтому используем латиницу, а описание — на русском. Хендлеры при этом ловят и /сделки, и /sdelki.
         try:
             from aiogram.types import BotCommand
 
             await bot.set_my_commands(
                 [
                     BotCommand(command="start", description="Запуск и верификация номера"),
-                    BotCommand(command="профиль", description="Личный кабинет — баланс, ROE, место"),
-                    BotCommand(command="сделки", description="Активные сделки"),
-                    BotCommand(command="история", description="Все сделки — статистика закрытых"),
-                    BotCommand(command="все_сделки", description="Все сделки и статистика"),
-                    BotCommand(command="торговать", description="Торговля — выбор монеты и открытие"),
-                    BotCommand(command="топ", description="Топ-10 лидеров недели"),
-                    BotCommand(command="позиции", description="Открытые позиции"),
-                    BotCommand(command="активные", description="Активные сделки"),
+                    BotCommand(command="profile", description="Личный кабинет — баланс, ROE, место"),
+                    BotCommand(command="sdelki", description="Активные сделки"),
+                    BotCommand(command="history", description="Все сделки — статистика закрытых"),
+                    BotCommand(command="vse_sdelki", description="Все сделки и статистика"),
+                    BotCommand(command="trade", description="Торговля — выбор монеты и открытие"),
+                    BotCommand(command="torgovat", description="Торговля — выбор монеты и открытие"),
+                    BotCommand(command="top", description="Топ-10 лидеров недели"),
+                    BotCommand(command="positions", description="Открытые позиции"),
+                    BotCommand(command="pozicii", description="Открытые позиции"),
                 ]
             )
         except Exception as e:
