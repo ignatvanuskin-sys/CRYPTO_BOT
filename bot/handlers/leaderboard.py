@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from aiogram import F, Router
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import select
+
+from bot.emojis import (
+    BRONZE_ID,
+    CHART_ID,
+    CROWN_ID,
+    DIAMOND_ID,
+    GOLD_ID,
+    PIN_ID,
+    SILVER_ID,
+    STAR_ID,
+    tg_emoji,
+)
+from bot.views import fmt_money, fmt_pct, main_menu
+from db.competition_models import Competition, CompetitionStatus, LeaderboardSnapshot
+from db.models import User
+from services.competition import get_active_competition
+from services.leaderboard import build_leaderboard, get_top_n, get_user_rank
+
+router = Router()
+
+TG_GOLD = tg_emoji(GOLD_ID, "🥇")
+TG_SILVER = tg_emoji(SILVER_ID, "🥈")
+TG_BRONZE = tg_emoji(BRONZE_ID, "🥉")
+TG_CROWN = tg_emoji(CROWN_ID, "👑")
+TG_STAR = tg_emoji(STAR_ID, "⭐️")
+TG_CHART = tg_emoji(CHART_ID, "📊")
+TG_DIAMOND = tg_emoji(DIAMOND_ID, "💎")
+TG_PIN = tg_emoji(PIN_ID, "📌")
+
+
+def _medal(rank: int) -> str:
+    if rank == 1:
+        return TG_GOLD
+    if rank == 2:
+        return TG_SILVER
+    if rank == 3:
+        return TG_BRONZE
+    return f"{rank}."
+
+
+def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dict[int, User], is_final: bool) -> str:
+    """Красивая таблица топ-10."""
+    header = f"{TG_CROWN} <b>{title}</b>\n"
+    if is_final:
+        header += f"{TG_STAR} <i>Итоги недели — финальный топ-10</i>\n"
+    else:
+        header += f"{TG_CHART} <i>Live топ-10 — обновляется каждую сделку</i>\n"
+    header += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    if not leaderboard:
+        return header + "Пока нет участников. Открой первую сделку!"
+
+    lines = []
+    for entry in leaderboard[:10]:
+        rank = entry["rank"]
+        user = users_map.get(entry["user_id"])
+        name = (user.username if user and user.username else f"ID{entry['user_id']}")[:16]
+        # Escape html in name? Keep simple
+        medal = _medal(rank)
+        roi = fmt_pct(entry["roi"])
+        equity = fmt_money(entry["equity"])
+        # Make top3 bold
+        if rank <= 3:
+            lines.append(f"{medal} <b>{name}</b>\n   {roi}  {equity}")
+        else:
+            lines.append(f"{medal} {name}\n   {roi}  {equity}")
+
+    body = "\n\n".join(lines)
+    return header + body
+
+
+async def _get_leaderboard_for_display(session):
+    """Возвращает (title, leaderboard, users_map, is_final, competition)."""
+    comp = await get_active_competition(session)
+    if comp is not None:
+        # Live leaderboard for active
+        lb = await build_leaderboard(session, comp.id)
+        # Build users map
+        user_ids = [e["user_id"] for e in lb[:10]]
+        users_map = {}
+        if user_ids:
+            res = await session.execute(select(User).where(User.id.in_(user_ids)))
+            for u in res.scalars().all():
+                users_map[u.id] = u
+        title = comp.name.upper()
+        return title, lb[:10], users_map, False, comp
+
+    # No active — show last finished
+    res = await session.execute(
+        select(Competition).where(Competition.status == CompetitionStatus.FINISHED.value).order_by(Competition.ends_at.desc()).limit(1)
+    )
+    comp = res.scalar_one_or_none()
+    if comp is not None:
+        # Use snapshot if exists
+        snap_res = await session.execute(
+            select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id).order_by(LeaderboardSnapshot.rank).limit(10)
+        )
+        snaps = snap_res.scalars().all()
+        if snaps:
+            lb = []
+            for s in snaps:
+                lb.append({"rank": s.rank, "user_id": s.user_id, "roi": s.roi, "equity": s.equity})
+            user_ids = [s.user_id for s in snaps]
+            users_map = {}
+            if user_ids:
+                res2 = await session.execute(select(User).where(User.id.in_(user_ids)))
+                for u in res2.scalars().all():
+                    users_map[u.id] = u
+            title = f"{comp.name.upper()} — ФИНАЛ"
+            return title, lb, users_map, True, comp
+        # Fallback to live build if no snapshot
+        lb = await build_leaderboard(session, comp.id)
+        user_ids = [e["user_id"] for e in lb[:10]]
+        users_map = {}
+        if user_ids:
+            res = await session.execute(select(User).where(User.id.in_(user_ids)))
+            for u in res.scalars().all():
+                users_map[u.id] = u
+        title = f"{comp.name.upper()} — ФИНАЛ"
+        return title, lb[:10], users_map, True, comp
+
+    return None, [], {}, False, None
+
+
+@router.message(Command("top"))
+@router.message(Command("leaderboard"))
+@router.message(Command("leaders"))
+@router.message(F.text.in_({"Топ", "Топ 10", "Лидеры", "Таблица лидеров", "🏆 Топ 10", "🏆 Топ"}))
+async def cmd_top(message: Message, session):
+    if message.from_user is None:
+        return
+    # Clear trade_state if any
+    try:
+        from bot.handlers.trade import trade_state
+        trade_state.pop(message.from_user.id, None)
+    except Exception:
+        pass
+
+    title, lb, users_map, is_final, comp = await _get_leaderboard_for_display(session)
+
+    if comp is None:
+        await message.answer(
+            f"{TG_CHART} <b>Топ пока пуст</b>\n\nТурнир ещё не начался. Открой сделку — попадёшь в таблицу!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+        return
+
+    text = _format_leaderboard_text(title, lb, users_map, is_final)
+    # Add user's own rank footer
+    user = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
+    if user:
+        rank_info = await get_user_rank(session, comp.id, user.id) if not is_final else None
+        # For final, try to get from snapshot
+        if is_final:
+            snap = (await session.execute(select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id, LeaderboardSnapshot.user_id == user.id))).scalar_one_or_none()
+            if snap:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{snap.rank}</b>  {fmt_pct(snap.roi)}"
+            else:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты не в топ-10 этой недели"
+        elif rank_info:
+            if rank_info["rank"] <= 10:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{rank_info['rank']}</b>  {fmt_pct(rank_info['roi'])}"
+            else:
+                need = rank_info.get("need_for_top10")
+                need_str = f" до топ-10 нужно {fmt_pct(need)}" if need is not None else ""
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{rank_info['rank']}</b>  {fmt_pct(rank_info['roi'])}{need_str}"
+
+    # Time left for active
+    if comp and not is_final:
+        secs = max(0, int((comp.ends_at - datetime.now(timezone.utc)).total_seconds()))
+        days, rem = divmod(secs, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        if days > 0:
+            time_left = f"{days}д {hours}ч"
+        else:
+            time_left = f"{hours}ч {mins}м"
+        text += f"\n{tg_emoji('5413879192267805083', '🗓')} До итогов: {time_left}"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Обновить", callback_data="nav:top", icon_custom_emoji_id=CHART_ID)],
+            [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")],
+            [InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)],
+        ]
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.message(Command("positions"))
+@router.message(F.text.in_({"Позиции", "Открытые позиции", "Мои позиции"}))
+async def cmd_positions(message: Message, session):
+    if message.from_user is None:
+        return
+    try:
+        from bot.handlers.trade import trade_state
+        trade_state.pop(message.from_user.id, None)
+    except Exception:
+        pass
+    # Delegate to transactions but filtered to open only
+    # Reuse logic from profile's transactions but with open filter
+    from db.paper_models import PaperPosition, PositionStatus, TradingAccount
+    from bot.views import fmt_money, fmt_price, format_side
+
+    user = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
+    if not user:
+        await message.answer("Сначала отправь /start", reply_markup=main_menu())
+        return
+    if user.phone_verified_at is None:
+        from bot.keyboards import contact_keyboard
+        await message.answer("Сначала подтверди номер: /start", reply_markup=contact_keyboard())
+        return
+    account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
+    if not account:
+        await message.answer("Позиций пока нет. Нажми Торговать.", reply_markup=main_menu())
+        return
+    positions = (
+        await session.execute(
+            select(PaperPosition).where(PaperPosition.account_id == account.id, PaperPosition.status == PositionStatus.OPEN.value).order_by(PaperPosition.opened_at.desc())
+        )
+    ).scalars().all()
+    if not positions:
+        await message.answer(
+            f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажми Торговать, чтобы открыть.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+        return
+    # Build beautiful list for open positions only
+    from bot.emojis import GREEN_ID, RED_ID, tg_emoji
+
+    lines = [f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b> — {len(positions)}\n"]
+    kb_rows = []
+    for p in positions:
+        side_str = format_side(p.side)
+        # Use premium for side
+        from bot.emojis import TG_LONG, TG_SHORT
+
+        side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
+        pnl = p.unrealized_pnl
+        pnl_str = fmt_money(pnl)
+        # Color based on pnl
+        pnl_emoji = tg_emoji(GREEN_ID, "🟢") if pnl > 0 else tg_emoji(RED_ID, "🔴") if pnl < 0 else "⚪️"
+        lines.append(
+            f"{side_tag} <b>{p.symbol} {side_str} x{int(p.leverage)} </b> {pnl_emoji} {pnl_str}\n"
+            f"Вход {fmt_price(p.entry_price)} → Сейчас {fmt_price(p.current_price)}\n"
+            f"Объём {fmt_money(p.notional)}"
+        )
+        kb_rows.append([InlineKeyboardButton(text=f"Закрыть {p.symbol}", callback_data=f"close_preview:{p.id}", icon_custom_emoji_id=RED_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Сделки (все)", callback_data="nav:transactions", icon_custom_emoji_id=CHART_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Топ", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)])
+    text = "\n\n".join(lines)
+    await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+
+
+@router.callback_query(F.data == "nav:top")
+async def nav_top(callback: CallbackQuery, session):
+    # Reuse cmd_top logic but for callback
+    if callback.from_user is None:
+        await callback.answer()
+        return
+    try:
+        from bot.handlers.trade import trade_state
+        trade_state.pop(callback.from_user.id, None)
+    except Exception:
+        pass
+    # Build same as cmd_top but answer via callback.message
+    title, lb, users_map, is_final, comp = await _get_leaderboard_for_display(session)
+    if comp is None:
+        if callback.message:
+            await callback.message.answer(
+                f"{TG_CHART} <b>Топ пока пуст</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu(),
+            )
+        await callback.answer()
+        return
+    text = _format_leaderboard_text(title, lb, users_map, is_final)
+    # Add user rank footer
+    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
+    if user and comp:
+        if is_final:
+            snap = (await session.execute(select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id, LeaderboardSnapshot.user_id == user.id))).scalar_one_or_none()
+            if snap:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{snap.rank}</b>  {fmt_pct(snap.roi)}"
+            else:
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты не в топ-10"
+        else:
+            rank_info = await get_user_rank(session, comp.id, user.id)
+            if rank_info:
+                if rank_info["rank"] <= 10:
+                    text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{rank_info['rank']}</b>"
+                else:
+                    text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{rank_info['rank']}</b>"
+
+    if comp and not is_final:
+        secs = max(0, int((comp.ends_at - datetime.now(timezone.utc)).total_seconds()))
+        days, rem = divmod(secs, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        time_left = f"{days}д {hours}ч" if days > 0 else f"{hours}ч {mins}м"
+        text += f"\n{tg_emoji('5413879192267805083', '🗓')} До итогов: {time_left}"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Обновить", callback_data="nav:top", icon_custom_emoji_id=CHART_ID)],
+            [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")],
+            [InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)],
+        ]
+    )
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await callback.answer()

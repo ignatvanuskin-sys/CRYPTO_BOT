@@ -9,6 +9,7 @@ from aiogram.enums import ParseMode
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bot.handlers.admin import router as admin_router
+from bot.handlers.leaderboard import router as leaderboard_router
 from bot.handlers.profile import router as profile_router
 from bot.handlers.trade import router as trade_router
 from config import settings
@@ -65,6 +66,7 @@ async def main() -> None:
 
         dp.include_router(profile_router)
         dp.include_router(trade_router)
+        dp.include_router(leaderboard_router)
         dp.include_router(admin_router)
 
         # Background tasks inside the SAME process and event loop:

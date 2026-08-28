@@ -11,6 +11,7 @@ from bot.emojis import (
     CHART_UP_ID,
     CROSS_ID,
     CROWN_ID,
+    GOLD_ID,
     GREEN_ID,
     MONEY_ID,
     PARTY_ID,
@@ -215,6 +216,7 @@ async def _send_profile(telegram_id: int, session, target: Message | CallbackQue
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Сделки", callback_data="nav:transactions", icon_custom_emoji_id=CHART_ID)],
+                [InlineKeyboardButton(text="Топ 10", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)],
                 [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
             ]
         ),
