@@ -39,25 +39,28 @@ async def sync_instruments(engine: AsyncEngine):
                     continue
                 base = market.get('base', '')
                 quote = market.get('quote', '')
-                async with factory() as session:
-                    inst = await session.get(Instrument, inst_symbol)
-                    if inst is None:
-                        inst = Instrument(
-                            symbol=inst_symbol,
-                            base_asset=base,
-                            quote_asset=quote,
-                            status='active',
-                            price_precision=2,
-                            quantity_precision=6,
-                            min_quantity=Decimal("0.000001"),
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        session.add(inst)
-                    else:
-                        inst.base_asset = base
-                        inst.quote_asset = quote
-                        inst.status = 'active'
-                    await session.commit()
+                try:
+                    async with factory() as session:
+                        inst = await session.get(Instrument, inst_symbol)
+                        if inst is None:
+                            inst = Instrument(
+                                symbol=inst_symbol,
+                                base_asset=base,
+                                quote_asset=quote,
+                                status='active',
+                                price_precision=2,
+                                quantity_precision=6,
+                                min_quantity=Decimal("0.000001"),
+                                created_at=datetime.now(timezone.utc),
+                            )
+                            session.add(inst)
+                        else:
+                            inst.base_asset = base
+                            inst.quote_asset = quote
+                            inst.status = 'active'
+                        await session.commit()
+                except Exception as exc:
+                    logger.warning("Skipping instrument %s: %s", inst_symbol, exc)
         logger.info("Instruments sync complete")
     finally:
         await exchange.close()
@@ -76,35 +79,39 @@ async def fetch_once(exchange, engine: AsyncEngine) -> bool:
             tickers = await exchange.fetch_tickers()
             now = datetime.now(timezone.utc)
             factory = async_sessionmaker(engine, expire_on_commit=False)
-            async with factory() as session:
-                for sym, ticker in tickers.items():
-                    price = ticker.get("last") or ticker.get("close")
-                    bid = ticker.get("bid")
-                    ask = ticker.get("ask")
-                    ts = ticker.get("timestamp")
-                    if price is None or bid is None or ask is None or ts is None:
-                        increment("bingx_ticker_incomplete")
-                        continue
-                    exchange_ts = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-                    snap = PriceSnapshot(
-                        symbol=normalize_symbol(sym),
-                        bid=Decimal(str(bid)),
-                        ask=Decimal(str(ask)),
-                        last=Decimal(str(price)),
-                        exchange_timestamp=exchange_ts,
-                        received_at=now,
-                    )
-                    try:
-                        validate_snapshot(snap)
-                    except MarketDataInvalid as exc:
-                        increment("bingx_ticker_invalid")
-                        logger.warning("Skipping invalid BingX ticker %s: %s", sym, exc)
-                        continue
-                    # process-local cache only for local sqlite tests;
-                    # production execution reads the PostgreSQL snapshot
-                    update_snapshot(snap)
-                    await persist_snapshot(session, snap)
-                await session.commit()
+            for sym, ticker in tickers.items():
+                price = ticker.get("last") or ticker.get("close")
+                bid = ticker.get("bid")
+                ask = ticker.get("ask")
+                ts = ticker.get("timestamp")
+                if price is None or bid is None or ask is None or ts is None:
+                    increment("bingx_ticker_incomplete")
+                    continue
+                exchange_ts = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+                snap = PriceSnapshot(
+                    symbol=normalize_symbol(sym),
+                    bid=Decimal(str(bid)),
+                    ask=Decimal(str(ask)),
+                    last=Decimal(str(price)),
+                    exchange_timestamp=exchange_ts,
+                    received_at=now,
+                )
+                try:
+                    validate_snapshot(snap)
+                except MarketDataInvalid as exc:
+                    increment("bingx_ticker_invalid")
+                    logger.warning("Skipping invalid BingX ticker %s: %s", sym, exc)
+                    continue
+                # process-local cache only for local sqlite tests;
+                # production execution reads the PostgreSQL snapshot
+                update_snapshot(snap)
+                try:
+                    async with factory() as session:
+                        await persist_snapshot(session, snap)
+                        await session.commit()
+                except Exception as exc:
+                    increment("bingx_snapshot_persist_failed")
+                    logger.warning("Snapshot persist failed for %s: %s", snap.symbol, exc)
             consecutive_failures = 0
             return True
         except Exception as e:

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -18,7 +18,7 @@ class MarketSnapshot(Base):
 
     __tablename__ = "market_snapshots"
 
-    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(40), primary_key=True)
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="BINGX")
     market_type: Mapped[str] = mapped_column(String(16), nullable=False, default="PERPETUAL")
     bid: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)

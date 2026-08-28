@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import enum
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -65,7 +65,7 @@ class TradingAccount(Base):
 
 class Instrument(Base):
     __tablename__ = "instruments"
-    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)  # e.g. BTCUSDT
+    symbol: Mapped[str] = mapped_column(String(40), primary_key=True)  # e.g. BTCUSDT
     base_asset: Mapped[str] = mapped_column(Text, nullable=False)
     quote_asset: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(SAEnum(InstrumentStatus, name="instrument_status"), default=InstrumentStatus.active.value, nullable=False)
@@ -97,7 +97,7 @@ class PaperOrder(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[int] = mapped_column(Integer, ForeignKey("trading_accounts.id"), nullable=False)
     position_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("paper_positions.id"), nullable=True)
-    symbol: Mapped[str] = mapped_column(String(20), ForeignKey("instruments.symbol"), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(40), ForeignKey("instruments.symbol"), nullable=False)
     side: Mapped[str] = mapped_column(SAEnum(OrderSide, name="paper_order_side"), nullable=False)
     order_type: Mapped[str] = mapped_column(SAEnum(OrderType, name="paper_order_type"), default=OrderType.MARKET.value, nullable=False)
     quantity: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
@@ -115,7 +115,7 @@ class PaperPosition(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[int] = mapped_column(Integer, ForeignKey("trading_accounts.id"), nullable=False)
     competition_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("competitions.id"), nullable=True)
-    symbol: Mapped[str] = mapped_column(String(20), ForeignKey("instruments.symbol"), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(40), ForeignKey("instruments.symbol"), nullable=False)
     side: Mapped[str] = mapped_column(SAEnum(PositionSide, name="paper_position_side"), nullable=False)
     status: Mapped[str] = mapped_column(SAEnum(PositionStatus, name="paper_position_status"), default=PositionStatus.OPEN.value, nullable=False)
     quantity: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
