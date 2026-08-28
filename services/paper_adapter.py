@@ -451,7 +451,12 @@ async def close_position(
 
     # immutable execution for close
     # map reason to ExecutionReason
-    reason_map = {"manual": ExecutionReason.MANUAL_CLOSE.value, "TP": ExecutionReason.TAKE_PROFIT.value, "SL": ExecutionReason.STOP_LOSS.value}
+    reason_map = {
+        "manual": ExecutionReason.MANUAL_CLOSE.value,
+        "TP": ExecutionReason.TAKE_PROFIT.value,
+        "SL": ExecutionReason.STOP_LOSS.value,
+        "LIQUIDATION": ExecutionReason.LIQUIDATION.value,
+    }
     exec_reason = reason_map.get(reason, ExecutionReason.MANUAL_CLOSE.value)
     # competition_id from position or active
     comp_id = getattr(position, 'competition_id', None)
@@ -488,6 +493,13 @@ async def close_position(
     # now we return that margin plus the realized PnL.
     returned_margin = (position.notional / Decimal(str(position.leverage or 1))).quantize(Decimal("0.01"))
     return_amount = (returned_margin + net).quantize(Decimal("0.01"))
+    # Safety cap: prevent negative return (would violate CHECK balance_after>=0)
+    # Real liquidation should close before this, but cap as last resort
+    if return_amount < 0:
+        # Cap loss at margin
+        net = -returned_margin
+        return_amount = Decimal("0.00")
+        position.realized_pnl = net
     account.cash_balance = (account.cash_balance + return_amount).quantize(Decimal("0.01"))
     account.margin_used = (account.margin_used - returned_margin).quantize(Decimal("0.01"))
     if account.margin_used < 0:

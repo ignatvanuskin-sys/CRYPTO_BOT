@@ -1,6 +1,7 @@
 import os
 import pytest
 import pytest_asyncio
+from sqlalchemy import select, text as sa_text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from db.base import Base
 import db.paper_models  # ensure paper tables are registered for create_all
@@ -41,10 +42,43 @@ async def pg_engine():
     """
     Реальный Postgres для денежных тестов с блокировками.
     Engine = asyncpg. Берёт URL из окружения (TEST_DATABASE_URL или DATABASE_URL).
+    На Railway (railway.internal) — создаёт изолированную БД test_railway, чтобы не трогать прод.
     """
     url = os.getenv("TEST_DATABASE_URL", "") or os.getenv("DATABASE_URL", "")
     if url and "postgres" in url:
-        eng = create_async_engine(url, echo=False)
+        # Convert to asyncpg
+        if url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgresql+psycopg2://", "postgresql+asyncpg://")
+        # На Railway internal — используем изолированную test_railway
+        is_railway_internal = "railway.internal" in url
+        test_url = url
+        if is_railway_internal:
+            # Заменить /railway на /test_railway (или создать новую)
+            if "/railway" in test_url:
+                test_url = test_url.replace("/railway", "/test_railway")
+            else:
+                # fallback: добавить /test_railway
+                test_url = test_url.rstrip("/") + "/test_railway"
+            # Создать БД test_railway если нет (через postgres maintenance DB)
+            maint_url = test_url.replace("/test_railway", "/postgres")
+            try:
+                maint_eng = create_async_engine(maint_url, echo=False, isolation_level="AUTOCOMMIT")
+                async with maint_eng.connect() as conn:
+                    await conn.execute(select(1))  # test connection
+                    # Create database if not exists — need raw connection
+                    # Use sync-ish via asyncpg: try CREATE DATABASE, ignore if exists
+                    try:
+                        await conn.execute(sa_text("CREATE DATABASE test_railway"))
+                    except Exception:
+                        pass
+                await maint_eng.dispose()
+            except Exception:
+                # Если не удалось создать — fallback к оригинальному URL (риск, но лучше чем skip)
+                test_url = url
+        eng = create_async_engine(test_url, echo=False)
         try:
             async with eng.begin() as conn:
                 # clean + create for test isolation

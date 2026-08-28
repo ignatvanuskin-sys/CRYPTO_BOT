@@ -21,6 +21,7 @@ class ExecutionReason(str, enum.Enum):
     MANUAL_CLOSE = "MANUAL_CLOSE"
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP_LOSS = "STOP_LOSS"
+    LIQUIDATION = "LIQUIDATION"
 
 class Competition(Base):
     __tablename__ = "competitions"

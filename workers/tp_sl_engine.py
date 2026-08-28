@@ -56,20 +56,27 @@ async def check_and_close_positions(engine: AsyncEngine) -> int:
                 continue
             await refresh_account_stats(session, account)
 
-            reason = None
-            if position.side == "LONG":
-                if position.take_profit is not None and close_price >= position.take_profit:
-                    reason = "TP"
-                elif position.stop_loss is not None and close_price <= position.stop_loss:
-                    reason = "SL"
-            else:
-                if position.take_profit is not None and close_price <= position.take_profit:
-                    reason = "TP"
-                elif position.stop_loss is not None and close_price >= position.stop_loss:
-                    reason = "SL"
+            # Liquidation check — 90% of margin lost (protects from negative return_amount)
+            from decimal import Decimal
 
-            if reason is None:
-                continue
+            margin = (position.notional / Decimal(str(position.leverage or 1))).quantize(Decimal("0.01"))
+            if position.unrealized_pnl <= -margin * Decimal("0.9"):
+                reason = "LIQUIDATION"
+            else:
+                reason = None
+                if position.side == "LONG":
+                    if position.take_profit is not None and close_price >= position.take_profit:
+                        reason = "TP"
+                    elif position.stop_loss is not None and close_price <= position.stop_loss:
+                        reason = "SL"
+                else:
+                    if position.take_profit is not None and close_price <= position.take_profit:
+                        reason = "TP"
+                    elif position.stop_loss is not None and close_price >= position.stop_loss:
+                        reason = "SL"
+
+                if reason is None:
+                    continue
             try:
                 async with session.begin_nested():
                     await close_position(
@@ -80,9 +87,14 @@ async def check_and_close_positions(engine: AsyncEngine) -> int:
                         reason=reason,
                     )
                 closed_count += 1
-                increment("tp_triggered" if reason == "TP" else "sl_triggered")
+                if reason == "LIQUIDATION":
+                    increment("liquidation_triggered")
+                elif reason == "TP":
+                    increment("tp_triggered")
+                else:
+                    increment("sl_triggered")
                 logger.info(
-                    "TP/SL closed position %s %s %s at %s (%s)",
+                    "TP/SL/Liquidation closed position %s %s %s at %s (%s)",
                     position.id,
                     position.symbol,
                     position.side,
