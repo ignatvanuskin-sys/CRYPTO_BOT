@@ -70,9 +70,14 @@ async def finalize_expired_competitions(engine: AsyncEngine) -> int:
         )
         competitions = result.scalars().all()
         for competition in competitions:
-            if await finalize_competition_session(session, competition.id):
-                finalized += 1
-                finalized_ids.append(competition.id)
+            try:
+                async with session.begin_nested():
+                    if await finalize_competition_session(session, competition.id):
+                        finalized += 1
+                        finalized_ids.append(competition.id)
+            except Exception:
+                logger.exception("Finalize failed for competition %s", competition.id)
+                continue
         if finalized:
             await session.commit()
     for competition_id in finalized_ids:

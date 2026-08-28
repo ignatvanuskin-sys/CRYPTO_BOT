@@ -71,13 +71,14 @@ async def check_and_close_positions(engine: AsyncEngine) -> int:
             if reason is None:
                 continue
             try:
-                await close_position(
-                    session,
-                    position,
-                    account,
-                    idempotency_key=f"tp_sl:{position.id}:{snapshot.exchange_timestamp.isoformat()}:{reason}",
-                    reason=reason,
-                )
+                async with session.begin_nested():
+                    await close_position(
+                        session,
+                        position,
+                        account,
+                        idempotency_key=f"tp_sl:{position.id}:{snapshot.exchange_timestamp.isoformat()}:{reason}",
+                        reason=reason,
+                    )
                 closed_count += 1
                 increment("tp_triggered" if reason == "TP" else "sl_triggered")
                 logger.info(
@@ -89,7 +90,6 @@ async def check_and_close_positions(engine: AsyncEngine) -> int:
                     reason,
                 )
             except Exception:
-                await session.rollback()
                 logger.exception("TP/SL close failed for position %s", position.id)
         await session.commit()
     return closed_count

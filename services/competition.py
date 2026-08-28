@@ -41,11 +41,11 @@ async def get_or_create_default_competition(session: AsyncSession) -> Competitio
         price_source="BINGX",
         market_type="USD_M_PERPETUAL",
     )
-    session.add(comp)
     try:
-        await session.flush()
+        async with session.begin_nested():
+            session.add(comp)
+            await session.flush()
     except IntegrityError:
-        await session.rollback()
         comp = await get_active_competition(session)
         if comp is None:
             raise

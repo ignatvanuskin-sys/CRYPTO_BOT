@@ -146,8 +146,8 @@ async def open_position(
         raise PaperError("Side must be LONG/SHORT")
 
     leverage = Decimal(str(leverage))
-    if not leverage.is_finite() or leverage < 1:
-        raise PaperError("Leverage must be a finite number >= 1")
+    if not leverage.is_finite() or leverage < 1 or leverage > 20:
+        raise PaperError("Leverage must be a finite number between 1 and 20")
 
     # instrument
     inst = await session.get(Instrument, symbol)

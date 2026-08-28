@@ -54,7 +54,14 @@ async def main() -> None:
         async def db_middleware(handler, event, data):
             async with session_factory() as session:
                 data["session"] = session
-                return await handler(event, data)
+                try:
+                    return await handler(event, data)
+                except Exception:
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                    raise
 
         dp.include_router(profile_router)
         dp.include_router(trade_router)

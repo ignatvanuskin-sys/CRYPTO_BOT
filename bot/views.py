@@ -53,7 +53,9 @@ def bingx_chart_url(symbol: str) -> str:
 
 async def get_display_snapshot(session: AsyncSession, symbol: str):
     """Read only the shared PostgreSQL market snapshot for user display."""
+    from config import settings
+
     try:
-        return await get_shared_snapshot(session, symbol, 2000)
+        return await get_shared_snapshot(session, symbol, settings.market_data_max_age_ms)
     except Exception:
         return None

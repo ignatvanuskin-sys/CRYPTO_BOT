@@ -173,13 +173,20 @@ async def cmd_trade(message: Message, session):
 
 @router.callback_query(F.data == "nav:trade")
 async def nav_trade(callback: CallbackQuery, session):
-    if callback.message:
-        await cmd_trade(callback.message, session)
+    if callback.from_user is not None:
+        trade_state.pop(callback.from_user.id, None)
+    if callback.message is None:
+        await callback.answer()
+        return
+    await cmd_trade(callback.message, session)
     await callback.answer()
 
 
 @router.callback_query(F.data == "trade:coin")
 async def cb_coin_select(callback: CallbackQuery):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     trade_state[callback.from_user.id] = {"awaiting": "ticker_chart"}
     await callback.message.edit_text(
         f"{tg_emoji(DIAMOND_ID, '💎')} <b>ВЫБОР МОНЕТЫ</b>\n\nВведите тикер (например: SOL или SOLUSDT).\n"
@@ -192,6 +199,9 @@ async def cb_coin_select(callback: CallbackQuery):
 
 @router.callback_query(F.data == "trade:quick")
 async def cb_quick_open(callback: CallbackQuery):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     trade_state[callback.from_user.id] = {"awaiting": "ticker_trade"}
     await callback.message.edit_text(
         f"{tg_emoji(BOOM_ID, '💥')} <b>БЫСТРОЕ ОТКРЫТИЕ</b>\n\nВведите тикер (например: SOL или SOLUSDT).",
@@ -204,6 +214,12 @@ async def cb_quick_open(callback: CallbackQuery):
 @router.message(F.text)
 async def handle_trade_text(message: Message, session):
     """Единая точка текстового ввода торгового мастера (тикер/бюджет/TP-SL)."""
+    if message.from_user is None or message.text is None:
+        return
+    # Не перехватываем команды и навигацию — даём другим хендлерам шанс
+    if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать"):
+        trade_state.pop(message.from_user.id, None)
+        return
     state = trade_state.get(message.from_user.id)
     if not state or "awaiting" not in state:
         return
@@ -331,6 +347,9 @@ async def _show_confirmation(message: Message, state: dict, session):
 
 @router.callback_query(F.data.startswith("qsym:"))
 async def cb_quick_symbol(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     symbol = callback.data.split(":", 1)[1]
     inst = await _validate_instrument(session, symbol)
     if inst is None:
@@ -353,6 +372,9 @@ async def cb_quick_symbol(callback: CallbackQuery, session):
 
 @router.callback_query(F.data.startswith("re_lev:"))
 async def cb_re_leverage(callback: CallbackQuery):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     _, symbol, budget = callback.data.split(":")
     trade_state[callback.from_user.id] = {
         "symbol": symbol,
@@ -369,6 +391,9 @@ async def cb_re_leverage(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("lev:"))
 async def cb_leverage(callback: CallbackQuery):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     _, symbol, budget, leverage = callback.data.split(":")
     if leverage not in LEVERAGES:
         await callback.answer("Некорректное плечо", show_alert=True)
@@ -389,6 +414,9 @@ async def cb_leverage(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("side:"))
 async def cb_side(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     _, symbol, budget, leverage, side = callback.data.split(":")
     if side not in ("LONG", "SHORT"):
         await callback.answer("Некорректное направление", show_alert=True)
@@ -411,6 +439,9 @@ async def cb_side(callback: CallbackQuery, session):
 
 @router.callback_query(F.data.startswith("tpsl:"))
 async def cb_tp_sl(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     action, symbol, budget, leverage, side = callback.data.split(":")[1:]
     if action == "skip":
         st = {
@@ -444,6 +475,9 @@ async def cb_tp_sl(callback: CallbackQuery, session):
 
 @router.callback_query(F.data == "trade:confirm")
 async def cb_confirm(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     state = trade_state.get(callback.from_user.id, {})
     if not state.get("symbol"):
         await callback.answer("Сессия сделки устарела. Начните заново: /trade", show_alert=True)
@@ -525,6 +559,9 @@ async def cb_cancel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("close_preview:"))
 async def cb_close_preview(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     try:
         pos_id = int(callback.data.split(":", 1)[1])
     except ValueError:
@@ -572,6 +609,9 @@ async def cb_close_preview(callback: CallbackQuery, session):
 
 @router.callback_query(F.data.startswith("close_confirm:"))
 async def cb_close_confirm(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
     try:
         pos_id = int(callback.data.split(":", 1)[1])
     except ValueError:

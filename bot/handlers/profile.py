@@ -31,6 +31,18 @@ from bot.emojis import (
 )
 from bot.keyboards import contact_keyboard
 from bot.views import fmt_money, fmt_pct, main_menu
+from db.models import User
+from db.paper_models import PaperPosition, PositionStatus, TradingAccount
+from services.accounts import get_or_create_user, verify_phone
+from services.competition import get_or_create_default_competition, join_competition
+from services.leaderboard import get_user_rank
+from services.trading_account import get_or_create_trading_account
+
+# trade_state — очищаем при навигации вне торговли, чтобы не hijack-ить следующую команду
+try:
+    from bot.handlers.trade import trade_state as _trade_state  # type: ignore
+except ImportError:
+    _trade_state = {}
 
 router = Router()
 
@@ -132,18 +144,47 @@ async def handle_contact(message: Message, session):
 @router.message(Command("profile"))
 @router.message(F.text == "Личный кабинет")
 async def cmd_profile(message: Message, session):
-    user = await _get_user_by_telegram_id(session, message.from_user.id)
+    if message.from_user is None:
+        return
+    _trade_state.pop(message.from_user.id, None)
+    await _send_profile(message.from_user.id, session, message)
+
+
+@router.message(Command("transactions"))
+@router.message(F.text == "Сделки")
+async def cmd_transactions(message: Message, session):
+    if message.from_user is None:
+        return
+    _trade_state.pop(message.from_user.id, None)
+    await _send_transactions(message.from_user.id, session, message)
+
+
+async def _send_profile(telegram_id: int, session, target: Message | CallbackQuery):
+    """Shared profile renderer for message and callback."""
+    is_callback = isinstance(target, CallbackQuery)
+    chat_target = target.message if is_callback else target
+    if chat_target is None:
+        if is_callback:
+            await target.answer()
+        return
+    user = await _get_user_by_telegram_id(session, telegram_id)
     if not user:
-        await message.answer("Сначала отправьте /start")
+        await chat_target.answer("Сначала отправьте /start")
+        if is_callback:
+            await target.answer()
         return
     if user.phone_verified_at is None:
-        await message.answer("Сначала подтвердите номер телефона: /start", reply_markup=contact_keyboard())
+        await chat_target.answer("Сначала подтвердите номер телефона: /start", reply_markup=contact_keyboard())
+        if is_callback:
+            await target.answer()
         return
     account = (
         await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
     ).scalar_one_or_none()
     if not account:
-        await message.answer("Профиль ещё не создан. Отправьте /start")
+        await chat_target.answer("Профиль ещё не создан. Отправьте /start")
+        if is_callback:
+            await target.answer()
         return
 
     positions = (
@@ -168,7 +209,7 @@ async def cmd_profile(message: Message, session):
         f"{tg_emoji(CHART_UP_ID, '📈')} Общий ROE: {roe}\n"
         f"{TG_STAR} Место в рейтинге: {rank}"
     )
-    await message.answer(
+    await chat_target.answer(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
@@ -178,20 +219,30 @@ async def cmd_profile(message: Message, session):
             ]
         ),
     )
+    if is_callback:
+        await target.answer()
 
 
-@router.message(Command("transactions"))
-@router.message(F.text == "Сделки")
-async def cmd_transactions(message: Message, session):
-    user = await _get_user_by_telegram_id(session, message.from_user.id)
+async def _send_transactions(telegram_id: int, session, target: Message | CallbackQuery):
+    is_callback = isinstance(target, CallbackQuery)
+    chat_target = target.message if is_callback else target
+    if chat_target is None:
+        if is_callback:
+            await target.answer()
+        return
+    user = await _get_user_by_telegram_id(session, telegram_id)
     if not user:
-        await message.answer("Сначала отправьте /start")
+        await chat_target.answer("Сначала отправьте /start")
+        if is_callback:
+            await target.answer()
         return
     account = (
         await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
     ).scalar_one_or_none()
     if not account:
-        await message.answer("Сделок пока нет. Нажмите Торговать.", reply_markup=main_menu())
+        await chat_target.answer("Сделок пока нет. Нажмите Торговать.", reply_markup=main_menu())
+        if is_callback:
+            await target.answer()
         return
     positions = (
         await session.execute(
@@ -202,11 +253,13 @@ async def cmd_transactions(message: Message, session):
         )
     ).scalars().all()
     if not positions:
-        await message.answer(
+        await chat_target.answer(
             f"{TG_CHART} <b>МОИ СДЕЛКИ</b>\n\nСделок пока нет.\n\nНажмите Торговать, чтобы открыть первую.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu(),
         )
+        if is_callback:
+            await target.answer()
         return
 
     open_keyboard = InlineKeyboardMarkup(
@@ -239,24 +292,35 @@ async def cmd_transactions(message: Message, session):
             f"Вход: {fmt_money(p.entry_price)} → Выход: {fmt_money(p.current_price)}\n"
             f"{pnl_line} | {status_line}"
         )
-    await message.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=open_keyboard)
+    await chat_target.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=open_keyboard)
+    if is_callback:
+        await target.answer()
 
 
 @router.callback_query(F.data == "nav:home")
 async def nav_home(callback: CallbackQuery, session):
+    if callback.from_user is not None:
+        _trade_state.pop(callback.from_user.id, None)
+    if callback.message is None:
+        await callback.answer()
+        return
     await callback.message.answer("Главное меню:", reply_markup=main_menu())
     await callback.answer()
 
 
 @router.callback_query(F.data == "nav:profile")
 async def nav_profile(callback: CallbackQuery, session):
-    if callback.message:
-        await cmd_profile(callback.message, session)
-    await callback.answer()
+    if callback.from_user is None:
+        await callback.answer()
+        return
+    _trade_state.pop(callback.from_user.id, None)
+    await _send_profile(callback.from_user.id, session, callback)
 
 
 @router.callback_query(F.data == "nav:transactions")
 async def nav_transactions(callback: CallbackQuery, session):
-    if callback.message:
-        await cmd_transactions(callback.message, session)
-    await callback.answer()
+    if callback.from_user is None:
+        await callback.answer()
+        return
+    _trade_state.pop(callback.from_user.id, None)
+    await _send_transactions(callback.from_user.id, session, callback)

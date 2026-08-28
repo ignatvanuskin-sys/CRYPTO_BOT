@@ -33,7 +33,7 @@ def is_admin(telegram_id: int) -> bool:
 
 @router.message(Command("admin_stats"))
 async def admin_stats(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     user_count = (await session.execute(select(func.count()).select_from(User))).scalar_one()
@@ -42,7 +42,7 @@ async def admin_stats(message: Message, session):
 
 @router.message(Command("admin_ban"))
 async def admin_ban(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     parts = message.text.split(maxsplit=2)
@@ -67,7 +67,7 @@ async def admin_ban(message: Message, session):
 
 @router.message(Command("admin_unban"))
 async def admin_unban(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     parts = message.text.split(maxsplit=1)
@@ -86,7 +86,7 @@ async def admin_unban(message: Message, session):
 
 @router.message(Command("admin_active_competition"))
 async def admin_active_competition(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     result = await session.execute(
@@ -108,7 +108,7 @@ async def admin_active_competition(message: Message, session):
 
 @router.message(Command("admin_create_demo_cup"))
 async def admin_create_demo_cup(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     if not settings.demo_seed_enabled:
@@ -130,7 +130,7 @@ async def admin_create_demo_cup(message: Message, session):
 
 @router.message(Command("admin_seed_demo_players"))
 async def admin_seed_demo_players(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     if not settings.demo_seed_enabled:
@@ -159,7 +159,7 @@ async def admin_seed_demo_players(message: Message, session):
 
 @router.message(Command("admin_reconcile"))
 async def admin_reconcile(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     result = await session.execute(
@@ -179,7 +179,7 @@ async def admin_reconcile(message: Message, session):
 @router.message(Command("admin_finish_competition"))
 async def admin_finish_competition(message: Message, session):
     """Ручной триггер завершения турнира (фолбэк к фоновой задаче lifecycle)."""
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     result = await session.execute(
@@ -206,7 +206,7 @@ async def admin_finish_competition(message: Message, session):
 
 @router.message(Command("admin_product_stats"))
 async def admin_product_stats(message: Message, session):
-    if not is_admin(message.from_user.id):
+    if message.from_user is None or not is_admin(message.from_user.id):
         await message.answer("Нет доступа")
         return
     users = (await session.execute(select(func.count()).select_from(User))).scalar_one()
