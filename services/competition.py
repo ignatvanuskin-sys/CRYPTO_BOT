@@ -68,9 +68,54 @@ async def join_competition(session: AsyncSession, user_id: int, competition_id: 
     existing = result.scalar_one_or_none()
     if existing:
         return existing
-    # get trading account to set starting equity
+    # get trading account to set starting equity — clean sheet per tournament
     acc = await get_or_create_trading_account(session, user_id)
-    # starting equity = initial_balance (or account equity)
+    # If user is joining a NEW competition (different from last), reset account to clean sheet
+    # Check last participant
+    last_part = (
+        await session.execute(
+            select(CompetitionParticipant)
+            .where(CompetitionParticipant.user_id == user_id)
+            .order_by(CompetitionParticipant.joined_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    is_new_cup = last_part is None or last_part.competition_id != competition_id
+    if is_new_cup and acc.id is not None:
+        # Close any open positions from previous cup (should already be closed by lifecycle, but safety)
+        from db.paper_models import PaperPosition, PositionStatus
+
+        open_pos = await session.execute(
+            select(PaperPosition).where(PaperPosition.account_id == acc.id, PaperPosition.status == PositionStatus.OPEN.value)
+        )
+        # For clean sheet, we don't auto-close here — lifecycle does, but we ensure no carryover
+        # Reset account to initial_balance if it's not already
+        if acc.cash_balance != comp.initial_balance or acc.margin_used != Decimal("0") or acc.equity != comp.initial_balance:
+            # Create adjustment ledger to reset
+            from db.paper_models import AccountLedger, LedgerType
+
+            # Close all open positions' unrealized will be handled elsewhere, here just reset balances
+            delta = (comp.initial_balance - acc.cash_balance).quantize(Decimal("0.01"))
+            # Only reset if delta !=0
+            if delta != Decimal("0"):
+                acc.cash_balance = comp.initial_balance
+                acc.margin_used = Decimal("0")
+                acc.realized_pnl = Decimal("0")
+                acc.unrealized_pnl = Decimal("0")
+                acc.equity = comp.initial_balance
+                acc.available_margin = comp.initial_balance
+                acc.total_pnl = Decimal("0")
+                ledger = AccountLedger(
+                    account_id=acc.id,
+                    type=LedgerType.ADJUSTMENT.value,
+                    amount=delta,
+                    balance_after=acc.cash_balance,
+                    reference_type="competition_reset",
+                    reference_id=str(competition_id),
+                    idempotency_key=f"reset:{acc.id}:{competition_id}",
+                )
+                session.add(ledger)
+                await session.flush()
     starting = comp.initial_balance
     part = CompetitionParticipant(
         competition_id=competition_id,

@@ -108,18 +108,79 @@ async def sync_instruments(engine: AsyncEngine):
     finally:
         await exchange.close()
 
+DEMO_WATCHLIST = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "LTCUSDT", "BCHUSDT", "XLMUSDT", "ETCUSDT", "FILUSDT",
+    "TRXUSDT", "XMRUSDT", "ATOMUSDT", "VETUSDT", "ICPUSDT",
+    "UBUSDT", "1000PEPEUSDT", "SHIBUSDT", "MATICUSDT", "OPUSDT",
+]
+
+
+async def _get_relevant_symbols(engine: AsyncEngine) -> list[str]:
+    """Symbols to poll: demo watchlist + any symbol with open position."""
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            # Open positions
+            from db.paper_models import PaperPosition, PositionStatus
+
+            result = await session.execute(
+                select(PaperPosition.symbol).where(PaperPosition.status == PositionStatus.OPEN.value).distinct()
+            )
+            open_syms = {row[0] for row in result.all()}
+            # Combine with watchlist, dedupe
+            all_syms = set(DEMO_WATCHLIST) | open_syms
+            # Filter to only those that exist as active instruments (avoid polling delisted)
+            if all_syms:
+                from db.paper_models import Instrument
+
+                res = await session.execute(
+                    select(Instrument.symbol).where(Instrument.symbol.in_(list(all_syms)), Instrument.status == "active")
+                )
+                active = {r[0] for r in res.all()}
+                # If none of the watchlist is yet in instruments (first run), fallback to watchlist
+                return list(active) if active else list(all_syms)
+            return []
+    except Exception:
+        return DEMO_WATCHLIST
+
+
 async def fetch_once(exchange, engine: AsyncEngine) -> bool:
     """
     Один батч fetch_tickers с retry/backoff.
     Обновляет shared PostgreSQL snapshot (bid/ask/last) — единственный
     источник цен для исполнения и UI. Возвращает True при успехе.
+    Для демо опрашиваем только DEMO_WATCHLIST + символы с открытыми позициями (~20-30 вместо 950).
     """
     global consecutive_failures, last_alert_at
     max_retries = 3
     base_backoff = 0.5
     for attempt in range(max_retries):
         try:
-            tickers = await exchange.fetch_tickers()
+            # Определяем релевантные символы для этого цикла
+            relevant = await _get_relevant_symbols(engine)
+            # Map DB symbols (BTCUSDT) → CCXT symbols (BTC/USDT:USDT) for fetch
+            ccxt_symbols = None
+            if relevant:
+                # Build CCXT symbol list via markets (if loaded)
+                try:
+                    if exchange.markets:
+                        ccxt_symbols = []
+                        for db_sym in relevant:
+                            # Find market with normalized symbol == db_sym
+                            for ccxt_sym, m in exchange.markets.items():
+                                if normalize_symbol(ccxt_sym) == db_sym and m.get("swap"):
+                                    ccxt_symbols.append(ccxt_sym)
+                                    break
+                        if not ccxt_symbols:
+                            ccxt_symbols = None
+                except Exception:
+                    ccxt_symbols = None
+            if ccxt_symbols:
+                tickers = await exchange.fetch_tickers(ccxt_symbols)
+            else:
+                tickers = await exchange.fetch_tickers()
             now = datetime.now(timezone.utc)
             factory = async_sessionmaker(engine, expire_on_commit=False)
             async with factory() as session:
