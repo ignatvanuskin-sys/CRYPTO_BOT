@@ -18,8 +18,22 @@ export default function App() {
   const initData = useInitData()
 
   useEffect(() => {
-    fetch(`${API}/api/account`, { headers: { "X-Telegram-Init-Data": initData } })
-      .then(r => r.json()).then(setBalance).catch(()=>{})
+    if (!initData) return
+    fetch(`${API}/api/auth/telegram`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initData }),
+    })
+      .then(r => {
+        if (!r.ok) throw new Error("Telegram auth failed")
+        return fetch(`${API}/api/account`, { headers: { "X-Telegram-Init-Data": initData } })
+      })
+      .then(r => {
+        if (!r.ok) throw new Error("Account unavailable")
+        return r.json()
+      })
+      .then(setBalance)
+      .catch(() => setBalance(null))
   }, [initData])
 
   const openPos = async () => {

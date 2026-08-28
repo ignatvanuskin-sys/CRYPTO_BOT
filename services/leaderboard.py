@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from db.competition_models import CompetitionParticipant, LeaderboardSnapshot
 from db.paper_models import TradingAccount, PaperPosition, PositionStatus
+from services.metrics import increment
 
 async def build_leaderboard(session: AsyncSession, competition_id: int) -> list[dict]:
     result = await session.execute(select(CompetitionParticipant).where(CompetitionParticipant.competition_id == competition_id))
@@ -17,7 +18,8 @@ async def build_leaderboard(session: AsyncSession, competition_id: int) -> list[
             q = await session.execute(select(PaperPosition).where(PaperPosition.account_id == acc.id, PaperPosition.status == PositionStatus.OPEN.value))
             unrealized = sum((pos.unrealized_pnl for pos in q.scalars().all()), Decimal("0"))
             p.unrealized_pnl = unrealized
-            p.current_equity = (acc.cash_balance + unrealized).quantize(Decimal("0.01"))
+            p.realized_pnl = acc.realized_pnl
+            p.current_equity = (acc.cash_balance + acc.margin_used + unrealized).quantize(Decimal("0.01"))
             if p.starting_equity != 0:
                 p.roi = ((p.current_equity - p.starting_equity) / p.starting_equity * 100).quantize(Decimal("0.0001"))
             else:
@@ -25,7 +27,10 @@ async def build_leaderboard(session: AsyncSession, competition_id: int) -> list[
     await session.flush()
     # sort: ROI DESC, equity DESC, fewer trades, earlier joined
     # need trade count
-    sorted_parts = sorted(participants, key=lambda x: (-x.roi, -x.current_equity, x.joined_at))
+    sorted_parts = sorted(
+        participants,
+        key=lambda x: (-x.roi, -x.current_equity, x.joined_at, x.user_id),
+    )
     leaderboard = []
     for idx, p in enumerate(sorted_parts, start=1):
         p.rank = idx
@@ -42,6 +47,7 @@ async def build_leaderboard(session: AsyncSession, competition_id: int) -> list[
     return leaderboard
 
 async def get_top_n(session: AsyncSession, competition_id: int, n: int = 10) -> list[dict]:
+    increment("leaderboard_viewed")
     lb = await build_leaderboard(session, competition_id)
     return lb[:n]
 

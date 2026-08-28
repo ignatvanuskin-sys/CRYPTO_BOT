@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from db.base import Base
 import db.paper_models  # ensure new tables are registered for create_all
 import db.competition_models  # competitions, participants, executions
+import db.market_data  # shared authoritative market snapshots
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -171,7 +172,10 @@ async def make_pg_user_week(pg_session):
 @pytest.fixture(autouse=True)
 def clear_price_cache():
     from services.pricing import price_cache
+    from services.bingx_market_data import _price_cache as _bingx_cache
     price_cache.clear()
     price_cache.max_staleness = 3
+    _bingx_cache.clear()
     yield
     price_cache.clear()
+    _bingx_cache.clear()

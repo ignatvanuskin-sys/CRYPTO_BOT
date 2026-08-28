@@ -1,7 +1,7 @@
 from __future__ import annotations
 from decimal import Decimal
 from datetime import datetime, timezone
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from db.paper_models import TradingAccount, AccountLedger, LedgerType
@@ -45,8 +45,8 @@ async def get_or_create_trading_account(session: AsyncSession, user_id: int) -> 
             await session.flush()
             return acc
     except IntegrityError:
-        # race: another transaction created it
-        await session.rollback()
+        # The nested transaction rolled back only the losing account insert;
+        # preserve the caller's outer transaction and re-read the winner.
         result = await session.execute(select(TradingAccount).where(TradingAccount.user_id == user_id))
         acc = result.scalar_one()
         return acc
@@ -56,9 +56,21 @@ async def get_account_by_user(session: AsyncSession, user_id: int) -> TradingAcc
     return result.scalar_one_or_none()
 
 async def refresh_account_stats(session: AsyncSession, account: TradingAccount):
-    # recalc equity = cash + unrealized
-    account.equity = (account.cash_balance + account.unrealized_pnl).quantize(Decimal("0.01"))
-    account.available_margin = (account.cash_balance - account.margin_used).quantize(Decimal("0.01"))
+    # Reconcile unrealized PnL from authoritative open positions before
+    # materializing equity/ROI. This keeps leaderboard data server-owned.
+    from db.paper_models import PaperPosition, PositionStatus
+
+    result = await session.execute(
+        select(func.coalesce(func.sum(PaperPosition.unrealized_pnl), 0)).where(
+            PaperPosition.account_id == account.id,
+            PaperPosition.status == PositionStatus.OPEN.value,
+        )
+    )
+    account.unrealized_pnl = Decimal(str(result.scalar_one() or 0)).quantize(Decimal("0.01"))
+    # cash_balance is free cash; margin_used is reserved cash. Equity includes
+    # both, while available margin is the free-cash amount.
+    account.equity = (account.cash_balance + account.margin_used + account.unrealized_pnl).quantize(Decimal("0.01"))
+    account.available_margin = account.cash_balance.quantize(Decimal("0.01"))
     if account.available_margin < 0:
         account.available_margin = Decimal("0")
     account.total_pnl = (account.realized_pnl + account.unrealized_pnl).quantize(Decimal("0.01"))

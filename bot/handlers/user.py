@@ -185,8 +185,7 @@ async def cmd_portfolio(message: Message, session: AsyncSession):
         lines.append(f"Total unrealized PnL: {total_pnl:.2f}")
         await message.answer("\n".join(lines))
 
-@router.message(Command("history"))
-async def cmd_history(message: Message, session: AsyncSession):
+async def cmd_legacy_history(message: Message, session: AsyncSession):
     result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
     user = result.scalar_one_or_none()
     if not user:

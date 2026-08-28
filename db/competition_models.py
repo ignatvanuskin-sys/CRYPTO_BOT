@@ -93,3 +93,18 @@ class LeaderboardSnapshot(Base):
         UniqueConstraint("competition_id", "user_id", name="uq_snapshot_comp_user"),
         Index("ix_snapshot_comp_rank", "competition_id", "rank"),
     )
+
+
+class CompetitionPrize(Base):
+    __tablename__ = "competition_prizes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    competition_id: Mapped[int] = mapped_column(Integer, ForeignKey("competitions.id"), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="ASSIGNED")
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("competition_id", "rank", name="uq_competition_prize_rank"),
+        Index("ix_competition_prize_competition", "competition_id"),
+    )

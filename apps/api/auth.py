@@ -14,9 +14,10 @@ def validate_init_data(init_data: str, bot_token: str) -> dict | None:
         hash_received = parsed.pop("hash", None)
         if not hash_received:
             return None
-        # check auth_date not too old (24h)
+        # Reject stale and implausibly future Telegram init data.
         auth_date = int(parsed.get("auth_date", "0"))
-        if time.time() - auth_date > 86400:
+        age = time.time() - auth_date
+        if age > 86400 or age < -60:
             return None
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
         secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()

@@ -1,5 +1,7 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
+from bot.views import main_menu
+
 def contact_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Поделиться номером", request_contact=True)]],

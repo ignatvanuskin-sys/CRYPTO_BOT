@@ -52,6 +52,7 @@ class User(Base):
     phone_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rules_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_simulated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 

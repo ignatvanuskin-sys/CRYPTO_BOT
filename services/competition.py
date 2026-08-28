@@ -1,17 +1,31 @@
 from __future__ import annotations
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from db.competition_models import Competition, CompetitionParticipant, CompetitionStatus
+from db.competition_models import Competition, CompetitionParticipant, CompetitionPrize, CompetitionStatus
+from services.metrics import increment
 from db.paper_models import TradingAccount
 from services.trading_account import get_or_create_trading_account
 
 async def get_active_competition(session: AsyncSession) -> Competition | None:
-    result = await session.execute(select(Competition).where(Competition.status == CompetitionStatus.ACTIVE.value).order_by(Competition.id.desc()).limit(1))
+    result = await session.execute(
+        select(Competition)
+        .where(
+            Competition.status == CompetitionStatus.ACTIVE.value,
+            Competition.starts_at <= datetime.now(timezone.utc),
+            Competition.ends_at > datetime.now(timezone.utc),
+        )
+        .order_by(Competition.id.desc())
+        .limit(1)
+    )
     return result.scalar_one_or_none()
 
 async def get_or_create_default_competition(session: AsyncSession) -> Competition:
+    dialect = session.bind.dialect.name if session.bind else ""
+    if dialect == "postgresql":
+        await session.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": 82463519})
     comp = await get_active_competition(session)
     if comp:
         return comp
@@ -28,7 +42,13 @@ async def get_or_create_default_competition(session: AsyncSession) -> Competitio
         market_type="USD_M_PERPETUAL",
     )
     session.add(comp)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        comp = await get_active_competition(session)
+        if comp is None:
+            raise
     return comp
 
 async def join_competition(session: AsyncSession, user_id: int, competition_id: int | None = None) -> CompetitionParticipant:
@@ -39,6 +59,10 @@ async def join_competition(session: AsyncSession, user_id: int, competition_id: 
         comp = await session.get(Competition, competition_id)
         if not comp:
             raise ValueError("Competition not found")
+    if comp.status != CompetitionStatus.ACTIVE.value:
+        raise ValueError("Competition is not active")
+    if comp.ends_at <= datetime.now(timezone.utc):
+        raise ValueError("Competition has ended")
     # check already joined
     result = await session.execute(select(CompetitionParticipant).where(CompetitionParticipant.competition_id == competition_id, CompetitionParticipant.user_id == user_id))
     existing = result.scalar_one_or_none()
@@ -57,8 +81,23 @@ async def join_competition(session: AsyncSession, user_id: int, competition_id: 
         unrealized_pnl=Decimal("0"),
         roi=Decimal("0"),
     )
-    session.add(part)
-    await session.flush()
+    try:
+        async with session.begin_nested():
+            session.add(part)
+            await session.flush()
+    except IntegrityError:
+        existing = (
+            await session.execute(
+                select(CompetitionParticipant).where(
+                    CompetitionParticipant.competition_id == competition_id,
+                    CompetitionParticipant.user_id == user_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+        return existing
+    increment("competition_joined")
     return part
 
 async def update_participant_equity(session: AsyncSession, user_id: int, competition_id: int):
@@ -80,7 +119,7 @@ async def update_participant_equity(session: AsyncSession, user_id: int, competi
     # also need to update via pricing? For now use stored unrealized
     part.unrealized_pnl = unrealized
     part.realized_pnl = acc.realized_pnl
-    part.current_equity = (acc.cash_balance + unrealized).quantize(Decimal("0.01"))
+    part.current_equity = (acc.cash_balance + acc.margin_used + unrealized).quantize(Decimal("0.01"))
     # ROI
     if part.starting_equity != 0:
         part.roi = ((part.current_equity - part.starting_equity) / part.starting_equity * 100).quantize(Decimal("0.0001"))
@@ -89,12 +128,45 @@ async def update_participant_equity(session: AsyncSession, user_id: int, competi
     await session.flush()
 
 async def finish_competition(session: AsyncSession, competition_id: int):
-    comp = await session.get(Competition, competition_id)
-    if not comp:
+    """Finalize once, freeze authoritative ranking and assign demo prizes."""
+    comp = await session.get(Competition, competition_id, with_for_update=True)
+    if not comp or comp.status == CompetitionStatus.FINISHED.value:
         return
     comp.status = CompetitionStatus.FINISHED.value
-    # freeze ranking snapshot
     from services.leaderboard import build_leaderboard, snapshot_leaderboard
+
     leaderboard = await build_leaderboard(session, competition_id)
-    await snapshot_leaderboard(session, competition_id, leaderboard)
+    # snapshot_leaderboard is guarded by the database uniqueness constraint;
+    # only create it when no snapshot exists for this competition.
+    from db.competition_models import LeaderboardSnapshot
+    snapshot_exists = await session.execute(
+        select(LeaderboardSnapshot.id)
+        .where(LeaderboardSnapshot.competition_id == competition_id)
+        .limit(1)
+    )
+    if snapshot_exists.scalar_one_or_none() is None:
+        await snapshot_leaderboard(session, competition_id, leaderboard)
+
+    if comp.name == "DEMO TRADING CUP":
+        from services.demo import DEMO_PRIZES
+
+        prizes_exist = await session.execute(
+            select(CompetitionPrize.id)
+            .where(CompetitionPrize.competition_id == competition_id)
+            .limit(1)
+        )
+        if prizes_exist.scalar_one_or_none() is None:
+            now = datetime.now(timezone.utc)
+            for entry, amount in zip(leaderboard[: len(DEMO_PRIZES)], DEMO_PRIZES):
+                session.add(
+                    CompetitionPrize(
+                        competition_id=competition_id,
+                        rank=entry["rank"],
+                        user_id=entry["user_id"],
+                        amount=amount,
+                        status="ASSIGNED",
+                        assigned_at=now,
+                    )
+                )
+    increment("competition_finished")
     await session.flush()

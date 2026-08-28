@@ -15,6 +15,9 @@ if config.config_file_name is not None:
 
 from db.base import Base
 import db.models  # noqa
+import db.paper_models  # noqa
+import db.competition_models  # noqa
+import db.market_data  # noqa
 
 target_metadata = Base.metadata
 
@@ -25,6 +28,8 @@ def _get_url():
         # Railway provides postgresql://, but app needs postgresql+asyncpg://
         if env_url.startswith("postgresql://"):
             env_url = env_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif env_url.startswith("postgres://"):
+            env_url = env_url.replace("postgres://", "postgresql+asyncpg://", 1)
         return env_url
     return config.get_main_option("sqlalchemy.url")
 

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from db.models import Transaction, Order, Position, Week, User, Asset, LeaderboardSnapshot
+from db.market_data import MarketSnapshot
 from services.pricing import price_cache
 from services.trading import execute_buy, execute_sell
 from unittest.mock import AsyncMock, patch
@@ -58,6 +59,9 @@ async def test_price_poller_resilience(sqlite_engine):
     from workers.price_poller import fetch_once, consecutive_failures
     import workers.price_poller as poller
     from services.pricing import price_cache
+    from config import settings
+    old_trading_mode = settings.trading_mode
+    settings.trading_mode = "legacy"
     poller.consecutive_failures = 0
     price_cache.clear()
     price_cache.update("BTC-USDT", Decimal("50000"), datetime.now(timezone.utc))
@@ -82,11 +86,25 @@ async def test_price_poller_resilience(sqlite_engine):
     assert price_cache.is_stale("BTC-USDT") is True
     # успех после сбоев сбрасывает счётчик
     mock_exchange2 = AsyncMock()
-    mock_exchange2.fetch_tickers.return_value = {"BTC/USDT": {"last": 51000, "quoteVolume": 2000000}}
+    mock_exchange2.fetch_tickers.return_value = {
+        "BTC/USDT": {
+            "bid": 50999,
+            "ask": 51001,
+            "last": 51000,
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "quoteVolume": 2000000,
+        }
+    }
     ok2 = await fetch_once(mock_exchange2, eng, price_cache)
     assert ok2 is True
     assert poller.consecutive_failures == 0
     assert price_cache.is_stale("BTC-USDT") is False
+    async with async_sessionmaker(eng, expire_on_commit=False)() as s:
+        shared = await s.get(MarketSnapshot, "BTCUSDT")
+        assert shared is not None
+        assert shared.bid == Decimal("50999")
+        assert shared.ask == Decimal("51001")
+    settings.trading_mode = old_trading_mode
 
 # 3) Дедлок-тест на sqlite (логический) — параллельные buy/sell разных активов не виснут
 async def test_no_deadlock_different_assets_sqlite(session, make_user_week):

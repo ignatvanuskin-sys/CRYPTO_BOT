@@ -6,10 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from db.paper_models import TradingAccount, Instrument, PaperPosition, PaperOrder, AccountLedger, PositionStatus, OrderStatus, LedgerType
 from db.competition_models import Execution, ExecutionReason
-from services.pricing import price_cache, PriceStale, PriceNotAvailable
-from services.bingx_market_data import get_snapshot, is_stale, MarketDataUnavailable, MarketDataStale
+from services.bingx_market_data import (
+    get_execution_snapshot,
+    MarketDataUnavailable,
+    MarketDataStale,
+    MarketDataInvalid,
+)
 from services.pnl import calc_pnl, calc_unrealized, calc_notional
 from config import settings
+from services.metrics import increment
 
 QTY_Q = Decimal("0.000000000001")
 PRICE_Q = Decimal("0.000000000001")
@@ -31,6 +36,10 @@ async def _lock_account(session: AsyncSession, account_id: int):
         await session.execute(text("SELECT 1 FROM trading_accounts WHERE id = :id FOR UPDATE"), {"id": account_id})
 
 def _validate_tp_sl(side: str, entry: Decimal, tp: Decimal | None, sl: Decimal | None):
+    if tp is not None and not tp.is_finite():
+        raise InvalidTP_SL("TP must be finite")
+    if sl is not None and not sl.is_finite():
+        raise InvalidTP_SL("SL must be finite")
     if tp is not None:
         if side == "LONG" and tp <= entry:
             raise InvalidTP_SL("TP must be > entry for LONG")
@@ -41,6 +50,32 @@ def _validate_tp_sl(side: str, entry: Decimal, tp: Decimal | None, sl: Decimal |
             raise InvalidTP_SL("SL must be < entry for LONG")
         if side == "SHORT" and sl <= entry:
             raise InvalidTP_SL("SL must be > entry for SHORT")
+
+async def _resolve_idempotent_position(
+    session: AsyncSession,
+    idempotency_key: str,
+    account: TradingAccount,
+    symbol: str,
+    side: str,
+) -> PaperPosition:
+    """Collapse a duplicate-key conflict to the canonical existing result.
+
+    Used after a concurrent INSERT raised IntegrityError on the unique
+    idempotency_key. Guarantees 'same key = same result' even when two requests
+    race with the same key for different accounts/positions.
+    """
+    existing_order = (
+        await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))
+    ).scalar_one_or_none()
+    if existing_order is None:
+        raise PaperError("Idempotency key conflict")
+    if existing_order.account_id != account.id or existing_order.symbol != symbol or existing_order.side != side.upper():
+        raise PaperError("Idempotency key already used for another request")
+    if existing_order.status == OrderStatus.REJECTED.value:
+        raise InsufficientMargin(existing_order.rejection_reason or "Insufficient margin")
+    position = await session.get(PaperPosition, existing_order.position_id)
+    return position
+
 
 async def open_position(
     session: AsyncSession,
@@ -55,28 +90,57 @@ async def open_position(
     competition_id: int | None = None,
     requested_at: datetime | None = None,
 ) -> PaperPosition:
+    if not idempotency_key:
+        raise PaperError("Idempotency-Key required")
+
     # idempotency
     if idempotency_key:
-        existing = await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))
-        if existing.scalar_one_or_none():
-            order = (await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))).scalar_one()
-            if order.position_id:
-                pos = await session.get(PaperPosition, order.position_id)
+        existing_order = (await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))).scalar_one_or_none()
+        if existing_order is not None:
+            increment("idempotency_hit")
+            if existing_order.account_id != account.id or existing_order.symbol != symbol or existing_order.side != side.upper():
+                raise PaperError("Idempotency key already used for another request")
+            if existing_order.status == OrderStatus.REJECTED.value:
+                raise InsufficientMargin(existing_order.rejection_reason or "Insufficient margin")
+            if existing_order.position_id:
+                pos = await session.get(PaperPosition, existing_order.position_id)
                 return pos
             raise PaperError("Duplicate order but no position")
 
-    # competitions: resolve active if not given
+    # Every paper open must belong to a currently active, started, non-expired cup.
+    from db.competition_models import Competition, CompetitionStatus
+
+    now = datetime.now(timezone.utc)
     if competition_id is None:
-        from db.competition_models import Competition, CompetitionStatus
-        res = await session.execute(select(Competition).where(Competition.status == CompetitionStatus.ACTIVE.value).order_by(Competition.id.desc()).limit(1))
+        res = await session.execute(
+            select(Competition)
+            .where(
+                Competition.status == CompetitionStatus.ACTIVE.value,
+                Competition.starts_at <= now,
+                Competition.ends_at > now,
+            )
+            .order_by(Competition.id.desc())
+            .limit(1)
+        )
         comp = res.scalar_one_or_none()
         if comp:
             competition_id = comp.id
+        else:
+            raise PaperError("Competition ended")
+    else:
+        comp = await session.get(Competition, competition_id)
+        if (
+            not comp
+            or comp.status != CompetitionStatus.ACTIVE.value
+            or comp.starts_at > now
+            or comp.ends_at <= now
+        ):
+            raise PaperError("Competition ended")
 
     if requested_at is None:
         requested_at = datetime.now(timezone.utc)
 
-    side = side.upper()
+    side = side.strip().upper()
     if side not in ("LONG", "SHORT"):
         raise PaperError("Side must be LONG/SHORT")
 
@@ -89,25 +153,16 @@ async def open_position(
         if not inst or inst.status != "active":
             raise InvalidSymbol(f"Unknown symbol {symbol}")
 
-    # price from backend bid/ask — canonical BINGX perpetual
-    snap = get_snapshot(symbol)
-    if snap is None:
-        # fallback to legacy price_cache
-        try:
-            price, ts = price_cache.get_price_or_raise(symbol)
-            # synthesize bid/ask from last
-            snap_bid = snap_ask = price
-            snap_ts = ts
-        except:
-            raise PaperError("Market data unavailable")
-    else:
-        max_age = settings.market_data_max_age_ms
-        if is_stale(snap, max_age):
-            raise PaperError("Market data stale")
-        if snap.bid is None or snap.ask is None:
-            raise PaperError("Market data unavailable (no bid/ask)")
-        snap_bid, snap_ask = snap.bid, snap.ask
-        snap_ts = snap.exchange_timestamp or snap.received_at
+    # Price comes from the shared authoritative BingX perpetual snapshot.
+    # SQLite-only cache fallback exists for deterministic local unit tests.
+    try:
+        snap = await get_execution_snapshot(session, symbol, settings.market_data_max_age_ms)
+    except MarketDataStale:
+        raise PaperError("Market data stale")
+    except (MarketDataUnavailable, MarketDataInvalid):
+        raise PaperError("Market data unavailable")
+    snap_bid, snap_ask = snap.bid, snap.ask
+    snap_ts = snap.exchange_timestamp
 
     # LONG OPEN = ASK, SHORT OPEN = BID (spec 5)
     if side == "LONG":
@@ -130,11 +185,14 @@ async def open_position(
     # quantity from notional if provided (new TASK: frontend sends notional)
     if notional is not None:
         notional_dec = Decimal(str(notional))
-        if notional_dec <= 0:
+        if not notional_dec.is_finite() or notional_dec <= 0:
             raise InvalidQuantity("Notional must be >0")
         quantity = (notional_dec / executed_price).quantize(QTY_Q)
     elif quantity is not None:
-        quantity = Decimal(str(quantity)).quantize(QTY_Q)
+        quantity = Decimal(str(quantity))
+        if not quantity.is_finite() or quantity <= 0:
+            raise InvalidQuantity("Quantity must be a finite positive number")
+        quantity = quantity.quantize(QTY_Q)
         if quantity <= 0:
             raise InvalidQuantity("Quantity must be >0")
     else:
@@ -149,107 +207,127 @@ async def open_position(
 
     # lock account
     await _lock_account(session, account.id)
-    # refresh account from DB to get latest cash
+    # Re-check idempotency after the account lock. Two requests can both miss
+    # the initial lookup; the second must observe the committed winner before
+    # inserting another order with the same key.
     await session.refresh(account)
+    existing_after_lock = (
+        await session.execute(
+            select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key)
+        )
+    ).scalar_one_or_none()
+    if existing_after_lock is not None:
+        increment("idempotency_hit")
+        if existing_after_lock.account_id != account.id or existing_after_lock.symbol != symbol or existing_after_lock.side != side:
+            raise PaperError("Idempotency key already used for another request")
+        if existing_after_lock.status == OrderStatus.REJECTED.value:
+            raise InsufficientMargin(existing_after_lock.rejection_reason or "Insufficient margin")
+        existing_position = await session.get(PaperPosition, existing_after_lock.position_id)
+        return existing_position
 
     notional = calc_notional(executed_price, quantity)
     # margin check: required = notional (no leverage)
     if notional > account.available_margin:
-        order = PaperOrder(
-            account_id=account.id,
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            executed_price=executed_price,
-            status=OrderStatus.REJECTED.value,
-            idempotency_key=idempotency_key or f"rej-{datetime.now(timezone.utc).timestamp()}",
-            rejection_reason="Insufficient margin",
-            requested_price=raw_price,
-        )
-        session.add(order)
-        await session.flush()
+        try:
+            async with session.begin_nested():
+                order = PaperOrder(
+                    account_id=account.id,
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    executed_price=executed_price,
+                    status=OrderStatus.REJECTED.value,
+                    idempotency_key=idempotency_key or f"rej-{datetime.now(timezone.utc).timestamp()}",
+                    rejection_reason="Insufficient margin",
+                    requested_price=raw_price,
+                )
+                session.add(order)
+                await session.flush()
+        except IntegrityError:
+            return await _resolve_idempotent_position(session, idempotency_key, account, symbol, side)
         raise InsufficientMargin(f"Need {notional}, available {account.available_margin}")
 
-    # create order + position (with competition_id)
-    order = PaperOrder(
-        account_id=account.id,
-        symbol=symbol,
-        side=side,
-        quantity=quantity,
-        requested_price=raw_price,
-        executed_price=executed_price,
-        status=OrderStatus.FILLED.value,
-        idempotency_key=idempotency_key,
-        executed_at=datetime.now(timezone.utc),
-    )
-    session.add(order)
-    await session.flush()
+    # create order + position (with competition_id). The inserts run inside a
+    # savepoint so a concurrent duplicate idempotency key collapses to the
+    # existing position instead of raising a raw IntegrityError.
+    try:
+        async with session.begin_nested():
+            order = PaperOrder(
+                account_id=account.id,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                requested_price=raw_price,
+                executed_price=executed_price,
+                status=OrderStatus.FILLED.value,
+                idempotency_key=idempotency_key,
+                executed_at=datetime.now(timezone.utc),
+            )
+            session.add(order)
+            await session.flush()
 
-    position = PaperPosition(
-        account_id=account.id,
-        competition_id=competition_id,
-        symbol=symbol,
-        side=side,
-        status=PositionStatus.OPEN.value,
-        quantity=quantity,
-        entry_price=executed_price,
-        current_price=executed_price,
-        notional=notional,
-        take_profit=take_profit,
-        stop_loss=stop_loss,
-        unrealized_pnl=Decimal("0"),
-        opened_at=datetime.now(timezone.utc),
-    )
-    session.add(position)
-    await session.flush()
-    order.position_id = position.id
-    await session.flush()
+            position = PaperPosition(
+                account_id=account.id,
+                competition_id=competition_id,
+                symbol=symbol,
+                side=side,
+                status=PositionStatus.OPEN.value,
+                quantity=quantity,
+                entry_price=executed_price,
+                current_price=executed_price,
+                notional=notional,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                unrealized_pnl=Decimal("0"),
+                opened_at=datetime.now(timezone.utc),
+            )
+            session.add(position)
+            await session.flush()
+            order.position_id = position.id
+            await session.flush()
 
-    # immutable execution record (spec 7)
-    # need user_id and competition_id for execution
-    # get user_id via account
-    from db.models import User as LegacyUser
-    # account.user_id is the user
-    user_id = account.user_id
-    if competition_id is None:
-        # fallback: try to find participant's competition
-        from db.competition_models import CompetitionParticipant
-        res = await session.execute(select(CompetitionParticipant).where(CompetitionParticipant.user_id == user_id).order_by(CompetitionParticipant.joined_at.desc()).limit(1))
-        part = res.scalar_one_or_none()
-        if part:
-            competition_id = part.competition_id
-    if competition_id is not None:
-        execution = Execution(
-            position_id=position.id,
-            user_id=user_id,
-            competition_id=competition_id,
-            symbol=symbol,
-            side=side,
-            price_source="BINGX",
-            market_type="USD_M_PERPETUAL",
-            bid_price=snap_bid,
-            ask_price=snap_ask,
-            execution_price=executed_price,
-            quantity=quantity,
-            notional=notional,
-            market_timestamp=snap_ts,
-            requested_at=requested_at,
-            executed_at=datetime.now(timezone.utc),
-            execution_reason=ExecutionReason.OPEN.value,
-        )
-        session.add(execution)
-        await session.flush()
+            # immutable execution record (spec 7)
+            user_id = account.user_id
+            if competition_id is None:
+                from db.competition_models import CompetitionParticipant
 
-    # ledger TRADE_OPEN: deduct notional? For paper, margin_used increases, cash decreases? Spec: balance vs equity.
-    # Simplistic: cash_balance -= notional, margin_used += notional
-    # But then equity stays same (cash + unrealized). We'll track.
+                res = await session.execute(
+                    select(CompetitionParticipant)
+                    .where(CompetitionParticipant.user_id == user_id)
+                    .order_by(CompetitionParticipant.joined_at.desc())
+                    .limit(1)
+                )
+                part = res.scalar_one_or_none()
+                if part:
+                    competition_id = part.competition_id
+            if competition_id is not None:
+                execution = Execution(
+                    position_id=position.id,
+                    user_id=user_id,
+                    competition_id=competition_id,
+                    symbol=symbol,
+                    side=side,
+                    price_source="BINGX",
+                    market_type="USD_M_PERPETUAL",
+                    bid_price=snap_bid,
+                    ask_price=snap_ask,
+                    execution_price=executed_price,
+                    quantity=quantity,
+                    notional=notional,
+                    market_timestamp=snap_ts,
+                    requested_at=requested_at,
+                    executed_at=datetime.now(timezone.utc),
+                    execution_reason=ExecutionReason.OPEN.value,
+                )
+                session.add(execution)
+                await session.flush()
+    except IntegrityError:
+        return await _resolve_idempotent_position(session, idempotency_key, account, symbol, side)
+
+    # Reserve the notional in the paper account. `refresh_account_stats`
+    # reconciles equity and available margin from this state.
     account.cash_balance = (account.cash_balance - notional).quantize(Decimal("0.01"))
     account.margin_used = (account.margin_used + notional).quantize(Decimal("0.01"))
-    account.available_margin = (account.cash_balance - account.margin_used + account.margin_used)  # hack: available = cash - margin_used? Actually cash already deducted, so available = cash - margin_used? Keep simple: available = cash
-    # Simpler: available = cash_balance (since margin_used equals notional locked, but we already deducted)
-    # For no leverage, available = cash_balance
-    account.available_margin = account.cash_balance
-    account.equity = (account.cash_balance + account.unrealized_pnl).quantize(Decimal("0.01"))
 
     # ledger
     ledger = AccountLedger(
@@ -265,9 +343,11 @@ async def open_position(
 
     # update account stats
     from services.trading_account import refresh_account_stats
+
     await refresh_account_stats(session, account)
 
     await session.flush()
+    increment("trade_opened")
     return position
 
 async def close_position(
@@ -277,33 +357,30 @@ async def close_position(
     idempotency_key: str = "",
     reason: str = "manual",
 ) -> tuple[PaperPosition, Decimal]:
+    if not idempotency_key:
+        raise PaperError("Idempotency-Key required")
+
+    # Check the retry key before the status guard so a safe retry returns the
+    # original result instead of creating or attempting a second close.
+    existing_order = (await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))).scalar_one_or_none()
+    if existing_order is not None:
+        increment("idempotency_hit")
+        if existing_order.account_id != account.id or existing_order.position_id != position.id:
+            raise PaperError("Idempotency key already used for another request")
+        return position, position.realized_pnl
     if position.status != PositionStatus.OPEN.value:
+        increment("double_close_prevented")
         raise PaperError("Position not open")
 
-    # idempotency for close
-    if idempotency_key:
-        existing = await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))
-        if existing.scalar_one_or_none():
-            return position, position.realized_pnl
-
-    # get current price via bid/ask (spec 5: LONG CLOSE=BID, SHORT CLOSE=ASK)
-    snap = get_snapshot(position.symbol)
-    if snap is None:
-        try:
-            # fallback to legacy cache as synthesized bid/ask
-            price, ts = price_cache.get_price_or_raise(position.symbol)
-            snap_bid = snap_ask = price
-            snap_ts = ts
-        except:
-            raise PaperError("Market data unavailable")
-    else:
-        max_age = settings.market_data_max_age_ms
-        if is_stale(snap, max_age):
-            raise PaperError("Market data stale")
-        if snap.bid is None or snap.ask is None:
-            raise PaperError("Market data unavailable (no bid/ask)")
-        snap_bid, snap_ask = snap.bid, snap.ask
-        snap_ts = snap.exchange_timestamp or snap.received_at
+    # Close price also comes from the shared authoritative snapshot.
+    try:
+        snap = await get_execution_snapshot(session, position.symbol, settings.market_data_max_age_ms)
+    except MarketDataStale:
+        raise PaperError("Market data stale")
+    except (MarketDataUnavailable, MarketDataInvalid):
+        raise PaperError("Market data unavailable")
+    snap_bid, snap_ask = snap.bid, snap.ask
+    snap_ts = snap.exchange_timestamp
 
     # choose close price per side
     if position.side == "LONG":
@@ -325,22 +402,31 @@ async def close_position(
     gross = calc_pnl(position.side, position.entry_price, close_price, position.quantity)
     net = gross - position.fee_open - position.fee_close
 
-    # create close order
-    order = PaperOrder(
-        account_id=account.id,
-        position_id=position.id,
-        symbol=position.symbol,
-        side=position.side,
-        quantity=position.quantity,
-        requested_price=close_price,
-        executed_price=close_price,
-        status=OrderStatus.FILLED.value,
-        reduce_only=True,
-        idempotency_key=idempotency_key or f"close:{position.id}:{datetime.now(timezone.utc).timestamp()}",
-        executed_at=datetime.now(timezone.utc),
-    )
-    session.add(order)
-    await session.flush()
+    # create close order (savepoint-guarded against a concurrent duplicate key)
+    try:
+        async with session.begin_nested():
+            order = PaperOrder(
+                account_id=account.id,
+                position_id=position.id,
+                symbol=position.symbol,
+                side=position.side,
+                quantity=position.quantity,
+                requested_price=close_price,
+                executed_price=close_price,
+                status=OrderStatus.FILLED.value,
+                reduce_only=True,
+                idempotency_key=idempotency_key or f"close:{position.id}:{datetime.now(timezone.utc).timestamp()}",
+                executed_at=datetime.now(timezone.utc),
+            )
+            session.add(order)
+            await session.flush()
+    except IntegrityError:
+        existing_order = (
+            await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))
+        ).scalar_one_or_none()
+        if existing_order is not None and existing_order.account_id == account.id and existing_order.position_id == position.id:
+            return position, position.realized_pnl
+        raise
 
     # update position
     position.status = PositionStatus.CLOSED.value
@@ -405,9 +491,8 @@ async def close_position(
     session.add(ledger)
 
     from services.trading_account import refresh_account_stats
-    # need to recalc unrealized from other open positions
-    # for now just update equity
-    account.equity = (account.cash_balance + account.unrealized_pnl).quantize(Decimal("0.01"))
+    # Reconcile remaining open-position unrealized PnL and equity.
     await refresh_account_stats(session, account)
     await session.flush()
+    increment("trade_closed")
     return position, net

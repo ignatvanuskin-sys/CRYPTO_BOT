@@ -7,6 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from config import settings
 from db.models import Asset
+from services.bingx_market_data import normalize_symbol
+from services.metrics import increment
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +48,8 @@ async def sync_assets(engine):
             from db.paper_models import Instrument
             for symbol, market in swap_exchange.markets.items():
                 if market.get('swap') and market.get('active'):
-                    # e.g. BTC/USDT, keep as BTCUSDT for instruments
-                    inst_symbol = symbol.replace("/", "").replace(":", "")
+                    # e.g. BTC/USDT:USDT -> BTCUSDT for instruments
+                    inst_symbol = normalize_symbol(symbol)
                     # keep USDT perpetual only
                     if not inst_symbol.endswith("USDT"):
                         continue
@@ -86,37 +88,48 @@ async def fetch_once(exchange, engine, price_cache):
         try:
             tickers = await exchange.fetch_tickers()
             now = datetime.now(timezone.utc)
-            from services.bingx_market_data import PriceSnapshot, update_snapshot
+            from services.bingx_market_data import (
+                MarketDataInvalid,
+                PriceSnapshot,
+                normalize_symbol,
+                persist_snapshot,
+                update_snapshot,
+                validate_snapshot,
+            )
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
             for sym, ticker in tickers.items():
-                db_sym = sym.replace("/", "-")
-                price = ticker.get('last') or ticker.get('close')
-                if price is not None:
-                    price_cache.update(db_sym, Decimal(str(price)), now)
-                # also update bingx perpetual snapshot with bid/ask
-                bid = ticker.get('bid')
-                ask = ticker.get('ask')
-                ts = ticker.get('timestamp')
-                exchange_ts = datetime.fromtimestamp(ts/1000, tz=timezone.utc) if ts else now
-                # normalize symbol for instruments (BTCUSDT)
-                inst_sym = sym.replace("/", "").replace(":", "")
+                db_sym = sym.replace("/", "-").split(":", 1)[0]
+                price = ticker.get("last") or ticker.get("close")
+                bid = ticker.get("bid")
+                ask = ticker.get("ask")
+                ts = ticker.get("timestamp")
+                if price is None or bid is None or ask is None or ts is None:
+                    increment("bingx_error")
+                    logger.warning("Skipping incomplete BingX ticker %s", sym)
+                    continue
+                exchange_ts = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
                 snap = PriceSnapshot(
-                    symbol=sym,
-                    bid=Decimal(str(bid)) if bid is not None else None,
-                    ask=Decimal(str(ask)) if ask is not None else None,
-                    last=Decimal(str(price)) if price is not None else None,
+                    symbol=normalize_symbol(sym),
+                    bid=Decimal(str(bid)),
+                    ask=Decimal(str(ask)),
+                    last=Decimal(str(price)),
                     exchange_timestamp=exchange_ts,
                     received_at=now,
                 )
+                try:
+                    validate_snapshot(snap)
+                except MarketDataInvalid as exc:
+                    logger.warning("Skipping invalid BingX ticker %s: %s", sym, exc)
+                    continue
                 update_snapshot(snap)
-                # also store dash variant for legacy
-                alt = inst_sym
-                if alt:
-                    # store under both forms
-                    snap2 = PriceSnapshot(symbol=alt, bid=snap.bid, ask=snap.ask, last=snap.last, exchange_timestamp=exchange_ts, received_at=now)
-                    update_snapshot(snap2)
-                vol = ticker.get('quoteVolume')
-                if vol is not None:
-                    async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+                if settings.trading_mode != "paper":
+                    # Legacy weekly mode only. Paper execution reads the
+                    # shared PostgreSQL snapshot and never this process cache.
+                    price_cache.update(db_sym, snap.last, now)
+                async with session_factory() as session:
+                    await persist_snapshot(session, snap)
+                    vol = ticker.get("quoteVolume")
+                    if vol is not None:
                         res = await session.execute(select(Asset).where(Asset.symbol == db_sym))
                         asset = res.scalar_one_or_none()
                         if asset:
@@ -124,13 +137,14 @@ async def fetch_once(exchange, engine, price_cache):
                             asset.updated_at = now
                             min_vol = Decimal(settings.min_24h_quote_volume_usdt)
                             asset.is_quote_eligible = Decimal(str(vol)) >= min_vol
-                            await session.commit()
+                    await session.commit()
             consecutive_failures = 0
             return True
         except Exception as e:
             # rate limit / timeout / network
             is_last = attempt == max_retries - 1
             wait = base_backoff * (2 ** attempt)
+            increment("bingx_error")
             logger.warning(f"price poll attempt {attempt+1}/{max_retries} failed: {e}; retry in {wait:.1f}s")
             if not is_last:
                 await asyncio.sleep(wait)
@@ -143,8 +157,12 @@ async def fetch_once(exchange, engine, price_cache):
     return False
 
 async def poll_prices(engine, price_cache):
-    """Poll tickers batch and update cache + eligibility daily. Не падает целиком при ошибках ccxt."""
-    exchange = ccxt.bingx({'enableRateLimit': True})
+    """Poll BingX perpetual tickers and persist validated shared snapshots."""
+    market_type = "swap" if settings.bingx_market_type.lower() in {"perpetual", "swap"} else settings.bingx_market_type
+    exchange = ccxt.bingx({
+        "enableRateLimit": True,
+        "options": {"defaultType": market_type},
+    })
     try:
         while True:
             await fetch_once(exchange, engine, price_cache)
@@ -152,11 +170,17 @@ async def poll_prices(engine, price_cache):
     finally:
         await exchange.close()
 
-async def main():
+async def main(engine=None):
     from services.pricing import price_cache
-    engine = create_async_engine(settings.database_url_async, echo=False)
-    await sync_assets(engine)
-    await poll_prices(engine, price_cache)
+    owns_engine = engine is None
+    if engine is None:
+        engine = create_async_engine(settings.database_url_async, echo=False)
+    try:
+        await sync_assets(engine)
+        await poll_prices(engine, price_cache)
+    finally:
+        if owns_engine:
+            await engine.dispose()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
