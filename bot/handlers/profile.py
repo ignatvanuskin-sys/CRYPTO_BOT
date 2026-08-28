@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from decimal import Decimal
 
 from aiogram import F, Router
 from aiogram.enums import ParseMode
