@@ -1,8 +1,8 @@
 # CryptoBot — Paper Trading Demo на BingX: от А до Я
 
-> **Статус:** `main` — единый Railway-сервис `python -m bot.main`, демо-баланс $10 000, торговля LONG/SHORT по живым ценам BingX Perpetual, `paper_positions` + `market_snapshots`, `price_poller/tp_sl_engine/competition_lifecycle` — фоновые `asyncio.create_task` в том же процессе. Легаси TradeWeek сохранён в ветке `legacy/tradeweek-snapshot`.
+> **Статус:** `main` — единый Railway-сервис `python -m bot.main`, демо-баланс $10 000, торговля LONG/SHORT по живым ценам BingX Perpetual (DEMO_WATCHLIST 25 пар, <1с цикл), `paper_positions` + `market_snapshots`, `price_poller/tp_sl_engine/competition_lifecycle` — фоновые `asyncio.create_task` в том же процессе, `liquidation` 90% margin, `max_leverage` per-coin (BTC/ETH 300). Легаси TradeWeek сохранён в ветке `legacy/tradeweek-snapshot`.
 > **Бот:** `@crypto_demo_vbot` (id `8610467759`)
-> **Проект Railway:** `dynamic-curiosity` (`01e288e4-99a1-4602-b9c9-81549f951b70`), сервис `CRYPTO_BOT` + `Postgres`
+> **Проект Railway:** `dynamic-curiosity` (`01e288e4-99a1-4602-b9c9-81549f951b70`), сервис `CRYPTO_BOT` + `Postgres` (`test_railway` для PG-тестов)
 
 ---
 
@@ -139,7 +139,7 @@ C:\TGOD\CryptoBot\
 | `DATABASE_URL` | `sqlite+aiosqlite:///./paper.db` | `postgresql+asyncpg` в проде, `database_url_async` конвертирует `postgresql://` |
 | `REQUIRE_POSTGRES` | `false` | fail если не Postgres |
 | `INITIAL_BALANCE_USD` | `10000` | демо-грант |
-| `MARKET_DATA_MAX_AGE_MS` | `10000` | stale-порог для `get_execution_snapshot` (был 2000, поднят из-за 4с цикла 951 тикера) |
+| `MARKET_DATA_MAX_AGE_MS` | `3000` | stale-порог для `get_execution_snapshot` (25 пар → <1с цикл, было 10000 для 951) |
 | `PRICE_POLL_INTERVAL_SECONDS` | `2` | `poll_prices` sleep |
 | `BINGX_MARKET_TYPE` | `perpetual` | `swap` для ccxt |
 | `PAPER_SLIPPAGE_BPS` | `0` | |
@@ -378,7 +378,7 @@ services get_execution_snapshot ──► get_shared_snapshot (market_data_max_a
 - `alembic/env.py` — `DATABASE_URL` → `postgresql+asyncpg`, `target_metadata = Base.metadata`
 - `requirements.txt` — `aiogram, SQLAlchemy, asyncpg, aiosqlite, alembic, ccxt 4.3.89, pydantic, httpx` (без `fastapi/uvicorn/APScheduler`)
 - `runtime.txt` — `python-3.11.11`
-- Env прод: `BOT_TOKEN=861...`, `DATABASE_URL=postgresql://postgres:...@postgres.railway.internal:5432/railway`, `MARKET_DATA_MAX_AGE_MS=10000`, `ADMIN_TELEGRAM_IDS`
+- Env прод: `BOT_TOKEN=861...`, `DATABASE_URL=postgresql://postgres:...@postgres.railway.internal:5432/railway` (+ `test_railway` для PG-тестов), `MARKET_DATA_MAX_AGE_MS=3000`, `ADMIN_TELEGRAM_IDS`
 - Деплой: `railway up --detach -m "..."` → `railway deployment list` → `SUCCESS`, `railway logs` → `Single-process bot starting...`, `Instruments sync complete`, `Run polling for bot @crypto_demo_vbot`
 - SSH: `railway ssh --service Postgres -- psql` → `market_snapshots 951`, `BTC/ETH/SOL age 2-4с`; `railway ssh --service CRYPTO_BOT -- python3 /tmp/check.py` → handler checks
 
@@ -418,5 +418,29 @@ services get_execution_snapshot ──► get_shared_snapshot (market_data_max_a
 - Более сильный антифрод (`device fingerprint`)
 
 ---
+
+## 18. Улучшения P0-P2 — аудит 2026-08-28 (после A-Z)
+
+### P0.1 Ликвидация (критично)
+- **Проблема:** без стоп-лосса `unrealized` может уйти на `-notional` (LONG до 0, SHORT неограниченно), `return_amount = margin + net` уходит в минус → `CHECK balance_after>=0` → `DBAPIError` вместо бизнес-ошибки. На 300x достаточно 0.3% против.
+- **Исправление:** `db/competition_models.py:19` `ExecutionReason.LIQUIDATION` + миграция `008`, `services/paper_adapter.py:489` cap `return_amount<0 → 0`, `net=-margin`, `workers/tp_sl_engine.py:60` проверка `unrealized <= -margin*0.9 → LIQUIDATION` (savepoint, `liquidation_triggered`), тест `tests/test_liquidation.py` 3/3 (300x crash→cap, engine trigger, not premature).
+
+### P0.2 PG-тесты (4 skipped → green)
+- **Было:** `TEST_DATABASE_URL`/`DATABASE_URL` без `+asyncpg` → `ModuleNotFoundError psycopg2`, плюс `drop_all` на проде.
+- **Исправление:** `tests/conftest.py:40` конвертация `postgresql://→postgresql+asyncpg://`, `railway.internal` → изолированная `test_railway` (создаётся через `postgres` maintenance DB, `CREATE DATABASE IF NOT EXISTS`), `railway ssh --service CRYPTO_BOT -- pytest tests/test_paper_race_pg.py` → `4 passed` (см. `ACCEPTANCE_EVIDENCE.md`).
+
+### P1.3 Цена 10с при 300x — сужение опроса
+- **Было:** `price_poller` опрашивал все 951 `fetch_tickers()` → цикл ~4с, `MARKET_DATA_MAX_AGE_MS=10000` (10с) — для 300x уже риск.
+- **Исправление:** `workers/price_poller.py:26` `DEMO_WATCHLIST` 25 топ-монет + `_get_relevant_symbols()` (watchlist + `SELECT DISTINCT symbol WHERE status=OPEN`), `fetch_tickers(ccxt_symbols)` только для них → цикл <1с, `config.py:12` `MARKET_DATA_MAX_AGE_MS=3000` (3с), Railway var `MARKET_DATA_MAX_AGE_MS=3000`.
+
+### P1.4 `starting_equity` между турнирами
+- **Было:** `services/competition.py:74` `starting = comp.initial_balance` (10000) без сброса `TradingAccount` → при входе в новый кубок `account.equity` (например 12000) остаётся, `current_equity` сразу 12000 → ROI 20% на старте.
+- **Исправление:** `join_competition:74` — при `is_new_cup` (последний `CompetitionParticipant.competition_id != current`) сброс `TradingAccount` к `initial_balance` через `AccountLedger ADJUSTMENT` (`reset:{acc.id}:{comp.id}`), `starting=current=initial`, тест `tests/test_competition_isolation.py:10` `test_starting_equity_clean_sheet`.
+
+### P2.5 Несколько позиций на один актив
+- **Решение:** разрешено (как и было), `paper_positions` PK `id` (не `user+symbol`), `tp_sl_engine` per-position savepoint, `profile.py:212` показывает все (до 15), `trade.py:617` close per `position.id`. Тесты `test_competition_isolation.py:30` `test_multiple_positions_same_asset_allowed` (2 LONG BTC) и `test_multiple_positions_different_tp_sl` (только одна из 2 с TP 110/120 закрывается при 111).
+
+### P2.6 `docs/ANTI_CHEAT_AUDIT.md`
+- Обновлён под leverage: строка `10` — ликвидация (`tp_sl_engine 90% margin`, `LIQUIDATION`, cap, `CHECK`), `6` — perpetual (все пары eligible, фильтр убран), `7` — `INITIAL_BALANCE` idempotent, `price_poller` 25 пар, `starting_equity` clean sheet, `format_side`/`fmt_price`.
 
 *Файл сгенерирован из кода `main` на 2026-08-28. Все пути указаны как в репо `C:\TGOD\CryptoBot`.*
