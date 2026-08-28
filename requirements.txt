@@ -1,0 +1,16 @@
+aiogram==3.22.0
+SQLAlchemy==2.0.51
+asyncpg==0.30.0
+aiosqlite==0.20.0
+alembic==1.15.2
+ccxt==4.3.89
+APScheduler==3.10.4
+pydantic==2.11.7
+pydantic-settings==2.10.1
+python-dotenv==1.1.1
+httpx==0.27.2
+fastapi==0.115.6
+uvicorn==0.34.0
+# test deps (not needed at runtime but keep for `pytest` locally)
+pytest==9.1.1
+pytest-asyncio==1.4.0
