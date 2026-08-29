@@ -30,9 +30,54 @@ def main_menu() -> ReplyKeyboardMarkup:
 def back_keyboard(target: str = "nav:home") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Назад", callback_data=target, icon_custom_emoji_id=PIN_ID)]
+            [btn("Назад", target, icon=PIN_ID)]
         ]
     )
+
+
+def btn(text: str, callback_data: str, icon: str | None = None, style: str | None = None) -> InlineKeyboardButton:
+    """Inline-кнопка с premium-иконкой и цветом (Bot API 9.4: danger/success/primary).
+
+    style:
+      - "danger"  — красный (закрытие, отмена)
+      - "success" — зелёный (подтвердить, обновить)
+      - "primary" — синий (инфо, навигация)
+      - None      — стандартная
+    """
+    kwargs: dict = {"text": text, "callback_data": callback_data}
+    if icon:
+        kwargs["icon_custom_emoji_id"] = icon
+    if style:
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
+
+
+def safe_edit(target_message, text: str, markup=None, parse_mode=None):
+    """edit_text с fallback на answer (если сообщение изменить нельзя).
+
+    Используется для кнопок «Обновить» — обновляет окно на месте,
+    не создавая новое сообщение.
+    """
+    from aiogram.exceptions import TelegramBadRequest
+
+    async def _run():
+        if target_message is None:
+            return
+        try:
+            await target_message.edit_text(text, parse_mode=parse_mode, reply_markup=markup)
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                return  # контент не изменился — это успех для «Обновить»
+            try:
+                await target_message.answer(text, parse_mode=parse_mode, reply_markup=markup)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                await target_message.answer(text, parse_mode=parse_mode, reply_markup=markup)
+            except Exception:
+                pass
+    return _run()
 
 
 def fmt_money(value: Decimal | int | float | None) -> str:

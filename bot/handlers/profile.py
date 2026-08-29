@@ -34,7 +34,7 @@ from bot.emojis import (
     tg_emoji,
 )
 from bot.keyboards import contact_keyboard
-from bot.views import fmt_money, fmt_pct, fmt_price, format_side, main_menu
+from bot.views import btn, fmt_money, fmt_pct, fmt_price, format_side, main_menu, safe_edit
 from db.models import User
 from db.paper_models import PaperPosition, PositionStatus, TradingAccount
 from services.accounts import get_or_create_user, verify_phone
@@ -240,9 +240,9 @@ async def _send_profile(telegram_id: int, session, target: Message | CallbackQue
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Сделки", callback_data="nav:transactions", icon_custom_emoji_id=GREEN_ID)],
-                [InlineKeyboardButton(text="Топ 10", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)],
-                [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
+                [btn("Сделки", "nav:transactions", icon=GREEN_ID, style="primary")],
+                [btn("Топ 10", "nav:top", icon=GOLD_ID, style="primary")],
+                [btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")],
             ]
         ),
     )
@@ -289,7 +289,7 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         # Нет активных — показать пусто и кнопку на историю
         kb_empty = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Посмотреть все сделки", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)],
+                [btn("Посмотреть все сделки", "nav:history:0", icon=CHART_ID, style="primary")],
             ]
         )
         await chat_target.answer(
@@ -307,24 +307,18 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         return
 
     kb_rows = [
-        [
-            InlineKeyboardButton(
-                text=f"Закрыть {p.symbol} {format_side(p.side)}",
-                callback_data=f"close_preview:{p.id}",
-                icon_custom_emoji_id=RED_ID,
-            )
-        ]
+        [btn(f"Закрыть {p.symbol} {format_side(p.side)}", f"close_preview:{p.id}", icon=RED_ID, style="danger")]
         for p in positions
     ]
     pag_row = []
     if offset > 0:
-        pag_row.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"nav:transactions:{max(0, offset - limit)}", icon_custom_emoji_id=PIN_ID))
+        pag_row.append(btn("◀ Назад", f"nav:transactions:{max(0, offset - limit)}", icon=PIN_ID))
     if offset + limit < total_active:
-        pag_row.append(InlineKeyboardButton(text="Ещё ▶", callback_data=f"nav:transactions:{offset + limit}", icon_custom_emoji_id=PIN_ID))
+        pag_row.append(btn("Ещё ▶", f"nav:transactions:{offset + limit}", icon=PIN_ID))
     if pag_row:
         kb_rows.append(pag_row)
-    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"nav:transactions:{offset}", icon_custom_emoji_id=GREEN_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Посмотреть все сделки", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)])
+    kb_rows.append([btn("Обновить", f"nav:transactions:{offset}", icon=GREEN_ID, style="success")])
+    kb_rows.append([btn("Посмотреть все сделки", "nav:history:0", icon=CHART_ID, style="primary")])
     open_keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     page_num = offset // limit + 1
     total_pages = (total_active + limit - 1) // limit if total_active else 1
@@ -339,9 +333,12 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
             f"Вход: {fmt_price(p.entry_price)} → Сейчас: {fmt_price(p.current_price)}\n"
             f"{pnl_line} | {status_line}"
         )
-    await chat_target.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=open_keyboard)
+    # Callback («Обновить»/навигация) — редактируем окно на месте, не создавая новое сообщение
     if is_callback:
+        await safe_edit(chat_target, "\n\n".join(lines), markup=open_keyboard, parse_mode=ParseMode.HTML)
         await target.answer()
+    else:
+        await chat_target.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=open_keyboard)
 
 
 async def _send_history(telegram_id: int, session, target: Message | CallbackQuery, offset: int = 0):
@@ -387,8 +384,8 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
     if total_closed == 0:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Активные сделки", callback_data="nav:transactions:0", icon_custom_emoji_id=CHART_ID)],
-                [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
+                [btn("Активные сделки", "nav:transactions:0", icon=CHART_ID, style="primary")],
+                [btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")],
             ]
         )
         await chat_target.answer(
@@ -443,14 +440,14 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
     kb_rows = []
     pag_row = []
     if offset > 0:
-        pag_row.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"nav:history:{max(0, offset - limit)}", icon_custom_emoji_id=PIN_ID))
+        pag_row.append(btn("◀ Назад", f"nav:history:{max(0, offset - limit)}", icon=PIN_ID))
     if offset + limit < total_closed:
-        pag_row.append(InlineKeyboardButton(text="Ещё ▶", callback_data=f"nav:history:{offset + limit}", icon_custom_emoji_id=PIN_ID))
+        pag_row.append(btn("Ещё ▶", f"nav:history:{offset + limit}", icon=PIN_ID))
     if pag_row:
         kb_rows.append(pag_row)
-    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"nav:history:{offset}", icon_custom_emoji_id=GREEN_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Активные сделки", callback_data="nav:transactions:0", icon_custom_emoji_id=CHART_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Топ 10", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)])
+    kb_rows.append([btn("Обновить", f"nav:history:{offset}", icon=GREEN_ID, style="success")])
+    kb_rows.append([btn("Активные сделки", "nav:transactions:0", icon=CHART_ID, style="primary")])
+    kb_rows.append([btn("Топ 10", "nav:top", icon=GOLD_ID, style="primary")])
 
     page_num = offset // limit + 1
     total_pages = (total_closed + limit - 1) // limit
@@ -472,9 +469,12 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
             f"Вход: {fmt_price(p.entry_price)} → Выход: {fmt_price(p.current_price)}  {fmt_pct((pnl / (p.notional / (p.leverage or 1)) * 100) if p.notional else 0)}\n"
             f"{p.closed_at.strftime('%d.%m %H:%M') if p.closed_at else ''}"
         )
-    await chat_target.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    # Callback («Обновить»/пагинация) — редактируем окно на месте
     if is_callback:
+        await safe_edit(chat_target, "\n\n".join(lines), markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode=ParseMode.HTML)
         await target.answer()
+    else:
+        await chat_target.answer("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 @router.callback_query(F.data == "nav:home")

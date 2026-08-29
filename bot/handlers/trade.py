@@ -35,7 +35,7 @@ from bot.emojis import (
     TG_LONG,
     TG_SHORT,
 )
-from bot.views import back_keyboard, bingx_chart_url, fmt_money, fmt_price, format_side, get_display_snapshot
+from bot.views import back_keyboard, bingx_chart_url, btn, fmt_money, fmt_price, format_side, get_display_snapshot
 from config import settings
 from db.models import User
 from db.paper_models import Instrument, PaperPosition, PositionStatus, TradingAccount
@@ -84,8 +84,8 @@ def safe_trade_error(exc: Exception) -> str:
 def trade_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="1. Выбрать монету", callback_data="trade:coin", icon_custom_emoji_id=DIAMOND_ID)],
-            [InlineKeyboardButton(text="2. Быстрое открытие", callback_data="trade:quick", icon_custom_emoji_id=BOOM_ID)],
+            [btn("1. Выбрать монету", "trade:coin", icon=DIAMOND_ID, style="primary")],
+            [btn("2. Быстрое открытие", "trade:quick", icon=BOOM_ID, style="primary")],
         ]
     )
 
@@ -102,11 +102,11 @@ def leverage_keyboard(symbol: str, budget: str, max_leverage: int | None = None)
         except Exception:
             pass
     row1 = [
-        InlineKeyboardButton(text=f"{lev}x", callback_data=f"lev:{symbol}:{budget}:{lev}", icon_custom_emoji_id=GEAR_ID)
+        btn(f"{lev}x", f"lev:{symbol}:{budget}:{lev}", icon=GEAR_ID, style="primary")
         for lev in allowed[:5]
     ]
     row2 = [
-        InlineKeyboardButton(text=f"{lev}x", callback_data=f"lev:{symbol}:{budget}:{lev}", icon_custom_emoji_id=GEAR_ID)
+        btn(f"{lev}x", f"lev:{symbol}:{budget}:{lev}", icon=GEAR_ID, style="primary")
         for lev in allowed[5:]
     ]
     rows = []
@@ -114,7 +114,7 @@ def leverage_keyboard(symbol: str, budget: str, max_leverage: int | None = None)
         rows.append(row1)
     if row2:
         rows.append(row2)
-    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)])
+    rows.append([btn("Отмена", "cancel_trade", icon=CROSS_ID, style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -122,11 +122,11 @@ def side_keyboard(symbol: str, budget: str, leverage: str) -> InlineKeyboardMark
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="LONG", callback_data=f"side:{symbol}:{budget}:{leverage}:LONG", icon_custom_emoji_id=LONG_EMOJI_ID),
-                InlineKeyboardButton(text="SHORT", callback_data=f"side:{symbol}:{budget}:{leverage}:SHORT", icon_custom_emoji_id=SHORT_EMOJI_ID),
+                btn("LONG", f"side:{symbol}:{budget}:{leverage}:LONG", icon=LONG_EMOJI_ID, style="success"),
+                btn("SHORT", f"side:{symbol}:{budget}:{leverage}:SHORT", icon=SHORT_EMOJI_ID, style="danger"),
             ],
-            [InlineKeyboardButton(text="К плечу", callback_data=f"re_lev:{symbol}:{budget}", icon_custom_emoji_id=GEAR_ID)],
-            [InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)],
+            [btn("К плечу", f"re_lev:{symbol}:{budget}", icon=GEAR_ID, style="primary")],
+            [btn("Отмена", "cancel_trade", icon=CROSS_ID, style="danger")],
         ]
     )
 
@@ -134,9 +134,9 @@ def side_keyboard(symbol: str, budget: str, leverage: str) -> InlineKeyboardMark
 def tp_sl_keyboard(symbol: str, budget: str, leverage: str, side: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Установить TP/SL", callback_data=f"tpsl:set:{symbol}:{budget}:{leverage}:{side}", icon_custom_emoji_id=STAR_ID)],
-            [InlineKeyboardButton(text="Пропустить", callback_data=f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon_custom_emoji_id=FREE_ID)],
-            [InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)],
+            [btn("Установить TP/SL", f"tpsl:set:{symbol}:{budget}:{leverage}:{side}", icon=STAR_ID, style="primary")],
+            [btn("Пропустить", f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon=FREE_ID)],
+            [btn("Отмена", "cancel_trade", icon=CROSS_ID, style="danger")],
         ]
     )
 
@@ -144,8 +144,8 @@ def tp_sl_keyboard(symbol: str, budget: str, leverage: str, side: str) -> Inline
 def confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Подтвердить сделку", callback_data="trade:confirm", icon_custom_emoji_id=CHECK_ID)],
-            [InlineKeyboardButton(text="Отмена", callback_data="cancel_trade", icon_custom_emoji_id=CROSS_ID)],
+            [btn("Подтвердить сделку", "trade:confirm", icon=CHECK_ID, style="success")],
+            [btn("Отмена", "cancel_trade", icon=CROSS_ID, style="danger")],
         ]
     )
 
@@ -269,8 +269,8 @@ async def handle_trade_text(message: Message, session):
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
-                        [InlineKeyboardButton(text="Открыть сделку", callback_data=f"qsym:{symbol}", icon_custom_emoji_id=BOOM_ID)],
-                        [InlineKeyboardButton(text="В меню торговли", callback_data="nav:trade", icon_custom_emoji_id=PIN_ID)],
+                        [btn("Открыть сделку", f"qsym:{symbol}", icon=BOOM_ID, style="primary")],
+                        [btn("В меню торговли", "nav:trade", icon=PIN_ID)],
                     ]
                 ),
             )
@@ -544,7 +544,7 @@ async def cb_tp_sl(callback: CallbackQuery, session):
         "Чтобы вернуться без TP/SL — нажмите «Пропустить».",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Назад", callback_data=f"tpsl:back:{symbol}:{budget}:{leverage}:{side}", icon_custom_emoji_id=PIN_ID)]
+            [btn("Назад", f"tpsl:back:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)]
         ]),
     )
     await callback.answer()
@@ -607,8 +607,8 @@ async def cb_confirm(callback: CallbackQuery, session):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="Мои сделки", callback_data="nav:transactions", icon_custom_emoji_id=CHART_ID)],
-                    [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
+                    [btn("Мои сделки", "nav:transactions", icon=CHART_ID, style="primary")],
+                    [btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")],
                 ]
             ),
         )
@@ -676,8 +676,8 @@ async def cb_close_preview(callback: CallbackQuery, session):
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Да, закрыть", callback_data=f"close_confirm:{position.id}", icon_custom_emoji_id=CHECK_ID)],
-                [InlineKeyboardButton(text="Отмена", callback_data="nav:transactions", icon_custom_emoji_id=CROSS_ID)],
+                [btn("Да, закрыть", f"close_confirm:{position.id}", icon=CHECK_ID, style="danger")],
+                [btn("Отмена", "nav:transactions", icon=CROSS_ID)],
             ]
         ),
     )
@@ -721,7 +721,7 @@ async def cb_close_confirm(callback: CallbackQuery, session):
             f"Реализованный PnL: {fmt_money(pnl)}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="Мои сделки", callback_data="nav:transactions", icon_custom_emoji_id=CHART_ID)]]
+                inline_keyboard=[[btn("Мои сделки", "nav:transactions", icon=CHART_ID, style="primary")]]
             ),
         )
         await callback.answer("Позиция закрыта")

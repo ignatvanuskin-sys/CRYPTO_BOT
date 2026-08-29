@@ -22,7 +22,7 @@ from bot.emojis import (
     STAR_ID,
     tg_emoji,
 )
-from bot.views import fmt_money, fmt_pct, main_menu
+from bot.views import btn, fmt_money, fmt_pct, main_menu
 from db.competition_models import Competition, CompetitionStatus, LeaderboardSnapshot
 from db.models import User
 from services.competition import get_active_competition
@@ -203,10 +203,10 @@ async def cmd_top(message: Message, session):
     # Pagination for initial view (page 0)
     kb_rows = []
     if total > 10:
-        kb_rows.append([InlineKeyboardButton(text="Ещё ▶", callback_data="nav:top:10", icon_custom_emoji_id=PIN_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data="nav:top:0", icon_custom_emoji_id=CHART_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")])
-    kb_rows.append([InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)])
+        kb_rows.append(btn("Ещё ▶", "nav:top:10", icon=PIN_ID))
+    kb_rows.append(btn("Обновить", "nav:top:0", icon=CHART_ID, style="success"))
+    kb_rows.append(btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success"))
+    kb_rows.append(btn("Назад", "nav:home", icon=PIN_ID))
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -273,7 +273,7 @@ async def _build_open_positions(telegram_id: int, session):
     ).scalars().all()
     if not positions:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Посмотреть все сделки", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)],
+            [btn("Посмотреть все сделки", "nav:history:0", icon=CHART_ID, style="primary")],
         ])
         return (f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажми Торговать, чтобы открыть.", kb)
 
@@ -290,10 +290,10 @@ async def _build_open_positions(telegram_id: int, session):
             f"Вход {fmt_price(p.entry_price)} → Сейчас {fmt_price(p.current_price)}\n"
             f"Объём {fmt_money(p.notional)}"
         )
-        kb_rows.append([InlineKeyboardButton(text=f"Закрыть {p.symbol}", callback_data=f"close_preview:{p.id}", icon_custom_emoji_id=RED_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data="nav:positions", icon_custom_emoji_id=GREEN_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Сделки (все)", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Топ", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)])
+        kb_rows.append(btn(f"Закрыть {p.symbol}", f"close_preview:{p.id}", icon=RED_ID, style="danger"))
+    kb_rows.append(btn("Обновить", "nav:positions", icon=GREEN_ID, style="success"))
+    kb_rows.append(btn("Сделки (все)", "nav:history:0", icon=CHART_ID, style="primary"))
+    kb_rows.append(btn("Топ", "nav:top", icon=GOLD_ID, style="primary"))
     return ("\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
@@ -357,14 +357,14 @@ async def nav_top(callback: CallbackQuery, session):
     kb_rows = []
     pag = []
     if offset > 0:
-        pag.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"nav:top:{max(0, offset-10)}", icon_custom_emoji_id=PIN_ID))
+        pag.append(btn("◀ Назад", f"nav:top:{max(0, offset-10)}", icon=PIN_ID))
     if offset + 10 < total:
-        pag.append(InlineKeyboardButton(text="Ещё ▶", callback_data=f"nav:top:{offset+10}", icon_custom_emoji_id=PIN_ID))
+        pag.append(btn("Ещё ▶", f"nav:top:{offset+10}", icon=PIN_ID))
     if pag:
         kb_rows.append(pag)
-    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"nav:top:{offset}", icon_custom_emoji_id=CHART_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id="5244837092042750681")])
-    kb_rows.append([InlineKeyboardButton(text="Назад", callback_data="nav:home", icon_custom_emoji_id=PIN_ID)])
+    kb_rows.append(btn("Обновить", f"nav:top:{offset}", icon=CHART_ID, style="success"))
+    kb_rows.append(btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success"))
+    kb_rows.append(btn("Назад", "nav:home", icon=PIN_ID))
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     if callback.message:
         try:
