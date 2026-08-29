@@ -141,6 +141,24 @@ def tp_sl_keyboard(symbol: str, budget: str, leverage: str, side: str) -> Inline
     )
 
 
+def tp_sl_input_keyboard(symbol: str, budget: str, leverage: str, side: str) -> InlineKeyboardMarkup:
+    """Клавиатура для ввода TP/SL: выбор ценой/процентами и одиночных."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                btn("Точной ценой", f"tpsl:mode:price:{symbol}:{budget}:{leverage}:{side}", icon=STAR_ID, style="primary"),
+                btn("В процентах", f"tpsl:mode:percent:{symbol}:{budget}:{leverage}:{side}", icon=STAR_ID, style="primary"),
+            ],
+            [
+                btn("Только TP", f"tpsl:only:tp:{symbol}:{budget}:{leverage}:{side}", icon=CHECK_ID, style="success"),
+                btn("Только SL", f"tpsl:only:sl:{symbol}:{budget}:{leverage}:{side}", icon=CROSS_ID, style="danger"),
+            ],
+            [btn("Пропустить", f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon=FREE_ID)],
+            [btn("Назад", f"tpsl:back:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)],
+        ]
+    )
+
+
 def confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -326,24 +344,98 @@ async def handle_trade_text(message: Message, session):
         )
         return
 
-    # --- Шаг: TP/SL ---
-    if step == "tp_sl":
+    # --- Шаг: TP/SL (поддержка ценой/процентами, одиночных) ---
+    if step in ("tp_sl", "tp_sl_choice", "tp_sl_price", "tp_sl_percent", "tp_only", "sl_only", "tp_only_percent", "sl_only_percent"):
         text = (message.text or "").strip()
-        tp = sl = None
-        if text.lower() != "skip":
-            parts = text.replace(",", " ").split()
-            if len(parts) != 2:
-                await message.answer(f"{TG_WARNING} Нужны ровно два числа через пробел: TP SL. Например: 180 160", parse_mode=ParseMode.HTML)
+        if text.lower() == "skip":
+            st = dict(state)
+            for k in ("awaiting", "mode"):
+                st.pop(k, None)
+            st["tp"], st["sl"] = None, None
+            trade_state[message.from_user.id] = st
+            await _show_confirmation(message, st, session)
+            return
+        # Определяем режим: ценой или процентами, одиночный или оба
+        is_percent = step in ("tp_sl_percent", "tp_only_percent", "sl_only_percent") or "%" in text
+        is_tp_only = step in ("tp_only", "tp_only_percent")
+        is_sl_only = step in ("sl_only", "sl_only_percent")
+        # Убираем % для парсинга
+        clean = text.replace("%", " ").replace(",", " ").strip()
+        parts = clean.split()
+        # Для одиночных — одно число, для обоих — два
+        if is_tp_only or is_sl_only:
+            if len(parts) != 1:
+                await message.answer(f"{TG_WARNING} Введите одно число для {'TP' if is_tp_only else 'SL'}.", parse_mode=ParseMode.HTML)
                 return
             try:
-                tp, sl = Decimal(parts[0]), Decimal(parts[1])
-                if not tp.is_finite() or not sl.is_finite() or tp <= 0 or sl <= 0:
+                val = Decimal(parts[0])
+                if not val.is_finite() or val <= 0:
                     raise InvalidOperation
             except (InvalidOperation, ValueError):
-                await message.answer(f"{TG_WARNING} TP и SL должны быть положительными числами.", parse_mode=ParseMode.HTML)
+                await message.answer(f"{TG_WARNING} Значение должно быть положительным числом.", parse_mode=ParseMode.HTML)
                 return
+            if is_percent:
+                # Рассчитать от текущей цены
+                snap = await get_display_snapshot(session, state["symbol"])
+                entry_est = snap.ask if state["side"] == "LONG" else snap.bid if snap else None
+                if entry_est is None:
+                    await message.answer(f"{TG_WARNING} Цена недоступна, введите точной ценой.", parse_mode=ParseMode.HTML)
+                    return
+                pct = val
+                if is_tp_only:
+                    tp = (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001")) if state["side"] == "LONG" else (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                    sl = None
+                else:
+                    sl = (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001")) if state["side"] == "LONG" else (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                    tp = None
+            else:
+                if is_tp_only:
+                    tp, sl = val, None
+                else:
+                    tp, sl = None, val
+        else:
+            # Оба: два числа
+            if len(parts) != 2:
+                await message.answer(f"{TG_WARNING} Нужны два числа через пробел: TP SL. Например: 180 160 или 5% -3%", parse_mode=ParseMode.HTML)
+                return
+            try:
+                v1, v2 = Decimal(parts[0]), Decimal(parts[1])
+                if not v1.is_finite() or not v2.is_finite():
+                    raise InvalidOperation
+                # Для процентов — v1/v2 могут быть отрицательными для SL? Для простоты требуем положительные для ценой, для процентов - любые
+                if not is_percent and (v1 <= 0 or v2 <= 0):
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                await message.answer(f"{TG_WARNING} Значения должны быть числами.", parse_mode=ParseMode.HTML)
+                return
+            if is_percent:
+                snap = await get_display_snapshot(session, state["symbol"])
+                entry_est = snap.ask if state["side"] == "LONG" else snap.bid if snap else None
+                if entry_est is None:
+                    await message.answer(f"{TG_WARNING} Цена недоступна, введите точной ценой.", parse_mode=ParseMode.HTML)
+                    return
+                # v1 = TP%, v2 = SL% (может быть отрицательным для SL? Но для простоты: TP +5, SL -3)
+                # Для LONG: TP% положительный = выше, SL% положительный = ниже (передаётся как -3 или 3?)
+                # Принимаем: первое — TP%, второе — SL% (SL% как положительное число — расстояние)
+                # Например: 5 -3  => TP +5%, SL -3% (для LONG: TP 5% выше, SL 3% ниже)
+                # Для SHORT: наоборот
+                def calc(entry, pct, is_tp):
+                    # pct как число: 5 => 5%, -3 => -3%
+                    return (entry * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                tp = calc(entry_est, v1, True)
+                sl = calc(entry_est, v2, False)
+                # Валидация: TP/SL должны быть положительными ценами
+                if tp <= 0 or sl <= 0:
+                    await message.answer(f"{TG_WARNING} Рассчитанные цены должны быть >0.", parse_mode=ParseMode.HTML)
+                    return
+            else:
+                tp, sl = v1, v2
+                if tp <= 0 or sl <= 0:
+                    await message.answer(f"{TG_WARNING} TP и SL должны быть >0.", parse_mode=ParseMode.HTML)
+                    return
         st = dict(state)
-        st.pop("awaiting", None)
+        for k in ("awaiting", "mode"):
+            st.pop(k, None)
         st["tp"], st["sl"] = tp, sl
         trade_state[message.from_user.id] = st
         await _show_confirmation(message, st, session)
@@ -495,21 +587,109 @@ async def cb_tp_sl(callback: CallbackQuery, session):
     if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
+    parts = callback.data.split(":")
+    # tpsl:mode:price:SYMBOL:budget:leverage:side  -> 7 parts
+    # tpsl:only:tp:SYMBOL:...  -> 7 parts
+    # tpsl:set:SYMBOL:... / tpsl:skip:... / tpsl:back:... -> 6 parts
     try:
-        action, symbol, budget, leverage, side = callback.data.split(":")[1:]
+        if len(parts) == 7 and parts[1] == "mode":
+            # tpsl:mode:price|percent:SYMBOL:budget:leverage:side
+            _, _, mode, symbol, budget, leverage, side = parts
+            if mode == "price":
+                trade_state[callback.from_user.id] = {"symbol": symbol, "budget": budget, "leverage": leverage, "side": side, "awaiting": "tp_sl_price", "mode": "price"}
+                await callback.message.edit_text(
+                    f"{TG_STAR} <b>ВВЕДИТЕ TP И SL — ТОЧНОЙ ЦЕНОЙ</b>\n\nДва числа через пробел, например: 180 160\n"
+                    "LONG: TP выше входа, SL ниже.\nSHORT: TP ниже входа, SL выше.\n\n"
+                    "Можно одно: введите одно число (например: 180 — только TP).\n"
+                    "Или напишите <code>skip</code> чтобы пропустить.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [btn("Пропустить", f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon=FREE_ID)],
+                        [btn("Назад", f"tpsl:set:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)],
+                    ]),
+                )
+                await callback.answer()
+                return
+            elif mode == "percent":
+                trade_state[callback.from_user.id] = {"symbol": symbol, "budget": budget, "leverage": leverage, "side": side, "awaiting": "tp_sl_percent", "mode": "percent"}
+                await callback.message.edit_text(
+                    f"{TG_STAR} <b>ВВЕДИТЕ TP И SL — В ПРОЦЕНТАХ</b>\n\nДва числа через пробел, например: 5 -3  (TP +5%, SL -3%)\n"
+                    "Можно с %: 5% -3%  или  +5  -3\n"
+                    "LONG: TP +, SL - ; SHORT: наоборот\n"
+                    "Можно одно: 5 (только TP) или -3 (только SL)\n"
+                    "Или <code>skip</code>.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [btn("Пропустить", f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon=FREE_ID)],
+                        [btn("Назад", f"tpsl:set:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)],
+                    ]),
+                )
+                await callback.answer()
+                return
+        if len(parts) == 7 and parts[1] == "only":
+            # tpsl:only:tp|sl:SYMBOL:budget:leverage:side
+            _, _, only, symbol, budget, leverage, side = parts
+            if only == "tp":
+                trade_state[callback.from_user.id] = {"symbol": symbol, "budget": budget, "leverage": leverage, "side": side, "awaiting": "tp_only", "mode": "price"}
+                await callback.message.edit_text(
+                    f"{TG_STAR} <b>ТОЛЬКО TP</b>\n\nВведите цену TP точной ценой, например: 180\n"
+                    f"Или в процентах: 5% (будет рассчитано от входа)\n"
+                    f"Для LONG TP выше входа, для SHORT — ниже.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [btn("В процентах", f"tpsl:only:tp_percent:{symbol}:{budget}:{leverage}:{side}", icon=STAR_ID)],
+                        [btn("Пропустить", f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon=FREE_ID)],
+                        [btn("Назад", f"tpsl:set:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)],
+                    ]),
+                )
+                await callback.answer()
+                return
+            elif only == "sl":
+                trade_state[callback.from_user.id] = {"symbol": symbol, "budget": budget, "leverage": leverage, "side": side, "awaiting": "sl_only", "mode": "price"}
+                await callback.message.edit_text(
+                    f"{TG_STAR} <b>ТОЛЬКО SL</b>\n\nВведите цену SL точной ценой, например: 160\n"
+                    f"Или в процентах: -5% (будет рассчитано)\n"
+                    f"Для LONG SL ниже входа, для SHORT — выше.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [btn("В процентах", f"tpsl:only:sl_percent:{symbol}:{budget}:{leverage}:{side}", icon=STAR_ID)],
+                        [btn("Пропустить", f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon=FREE_ID)],
+                        [btn("Назад", f"tpsl:set:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)],
+                    ]),
+                )
+                await callback.answer()
+                return
+            elif only in ("tp_percent", "sl_percent"):
+                is_tp = "tp" in only
+                trade_state[callback.from_user.id] = {"symbol": symbol, "budget": budget, "leverage": leverage, "side": side, "awaiting": "tp_only_percent" if is_tp else "sl_only_percent", "mode": "percent"}
+                await callback.message.edit_text(
+                    f"{TG_STAR} <b>ТОЛЬКО {'TP' if is_tp else 'SL'} — В ПРОЦЕНТАХ</b>\n\nВведите процент, например: 5  или  -3%\n"
+                    f"{'LONG TP +' if (is_tp and side=='LONG') or (not is_tp and side=='SHORT') else 'LONG SL -'} / {'SHORT TP -' if is_tp else 'SHORT SL +'}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [btn("Точной ценой", f"tpsl:only:{'tp' if is_tp else 'sl'}:{symbol}:{budget}:{leverage}:{side}", icon=STAR_ID)],
+                        [btn("Пропустить", f"tpsl:skip:{symbol}:{budget}:{leverage}:{side}", icon=FREE_ID)],
+                        [btn("Назад", f"tpsl:set:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)],
+                    ]),
+                )
+                await callback.answer()
+                return
+        # Fallback for 6-part: tpsl:back|skip|set
+        action, symbol, budget, leverage, side = parts[1:6] if len(parts) >= 6 else (None, None, None, None, None)
+        if len(parts) < 6:
+            raise ValueError()
     except ValueError:
         await callback.answer("Некорректные данные", show_alert=True)
         return
     if action == "back":
-        # Вернуться к селектору TP/SL (не к вводу)
-        st = {
+        # Назад к селектору TP/SL (не к подтверждению)
+        trade_state[callback.from_user.id] = {
             "symbol": symbol,
             "budget": budget,
             "leverage": leverage,
             "side": side,
             "awaiting": "tp_sl",
         }
-        trade_state[callback.from_user.id] = st
         await callback.message.edit_text(
             f"{TG_STAR} <b>TP/SL</b>\n\n"
             "Можно установить уровни тейк-профита и стоп-лосса или пропустить этот шаг.",
@@ -518,34 +698,24 @@ async def cb_tp_sl(callback: CallbackQuery, session):
         )
         await callback.answer()
         return
-    if action == "skip":
-        st = {
-            "symbol": symbol,
-            "budget": budget,
-            "leverage": leverage,
-            "side": side,
-            "tp": None,
-            "sl": None,
-        }
-        trade_state[callback.from_user.id] = st
-        await _show_confirmation(callback.message, st, session)
-        await callback.answer()
-        return
+    # Показываем выбор: ценой/процентами, оба или одиночный, пропустить
     trade_state[callback.from_user.id] = {
         "symbol": symbol,
         "budget": budget,
         "leverage": leverage,
         "side": side,
-        "awaiting": "tp_sl",
+        "awaiting": "tp_sl_choice",
     }
     await callback.message.edit_text(
-        f"{TG_STAR} <b>ВВЕДИТЕ TP И SL</b>\n\nДва числа через пробел (цены), например: 180 160\n"
-        "LONG: TP выше входа, SL ниже.\nSHORT: TP ниже входа, SL выше.\n\n"
-        "Чтобы вернуться без TP/SL — нажмите «Пропустить».",
+        f"{TG_STAR} <b>TP/SL — ВЫБЕРИТЕ РЕЖИМ</b>\n\n"
+        f"Пара: {symbol} | {side}\n\n"
+        f"Как установить уровни?\n"
+        f"• <b>Точной ценой</b> — например: 180 160\n"
+        f"• <b>В процентах</b> — например: 5% -3% (от входа)\n"
+        f"• <b>Только TP/SL</b> — один уровень\n\n"
+        f"LONG: TP выше входа, SL ниже.\nSHORT: TP ниже входа, SL выше.",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [btn("Назад", f"tpsl:back:{symbol}:{budget}:{leverage}:{side}", icon=PIN_ID)]
-        ]),
+        reply_markup=tp_sl_input_keyboard(symbol, budget, leverage, side),
     )
     await callback.answer()
 
