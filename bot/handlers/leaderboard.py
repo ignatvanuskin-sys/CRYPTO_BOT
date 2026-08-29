@@ -14,12 +14,17 @@ from sqlalchemy import select
 from bot.emojis import (
     BRONZE_ID,
     CHART_ID,
+    CHART_UP_ID,
     CROWN_ID,
     DIAMOND_ID,
     GOLD_ID,
+    GREEN_ID,
     PIN_ID,
+    RED_ID,
     SILVER_ID,
     STAR_ID,
+    TG_LONG,
+    TG_SHORT,
     tg_emoji,
 )
 from bot.views import btn, fmt_money, fmt_pct, main_menu
