@@ -240,7 +240,7 @@ async def _send_profile(telegram_id: int, session, target: Message | CallbackQue
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Сделки", callback_data="nav:transactions", icon_custom_emoji_id=CHART_ID)],
+                [InlineKeyboardButton(text="Сделки", callback_data="nav:transactions", icon_custom_emoji_id=GREEN_ID)],
                 [InlineKeyboardButton(text="Топ 10", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)],
                 [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
             ]
@@ -290,7 +290,6 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         kb_empty = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Посмотреть все сделки", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)],
-                [InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)],
             ]
         )
         await chat_target.answer(
@@ -324,9 +323,8 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         pag_row.append(InlineKeyboardButton(text="Ещё ▶", callback_data=f"nav:transactions:{offset + limit}", icon_custom_emoji_id=PIN_ID))
     if pag_row:
         kb_rows.append(pag_row)
-    # Кнопка на все сделки (история закрытых)
+    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"nav:transactions:{offset}", icon_custom_emoji_id=GREEN_ID)])
     kb_rows.append([InlineKeyboardButton(text="Посмотреть все сделки", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Торговать", callback_data="nav:trade", icon_custom_emoji_id=CHART_UP_ID)])
     open_keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     page_num = offset // limit + 1
     total_pages = (total_active + limit - 1) // limit if total_active else 1
@@ -450,7 +448,8 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
         pag_row.append(InlineKeyboardButton(text="Ещё ▶", callback_data=f"nav:history:{offset + limit}", icon_custom_emoji_id=PIN_ID))
     if pag_row:
         kb_rows.append(pag_row)
-    kb_rows.append([InlineKeyboardButton(text="Активные сделки", callback_data="nav:transactions:0", icon_custom_emoji_id=GREEN_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"nav:history:{offset}", icon_custom_emoji_id=GREEN_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Активные сделки", callback_data="nav:transactions:0", icon_custom_emoji_id=CHART_ID)])
     kb_rows.append([InlineKeyboardButton(text="Топ 10", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)])
 
     page_num = offset // limit + 1

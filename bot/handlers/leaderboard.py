@@ -224,49 +224,66 @@ async def cmd_positions(message: Message, session):
         trade_state.pop(message.from_user.id, None)
     except Exception:
         pass
-    # Delegate to transactions but filtered to open only
-    # Reuse logic from profile's transactions but with open filter
-    from db.paper_models import PaperPosition, PositionStatus, TradingAccount
-    from bot.views import fmt_money, fmt_price, format_side
-
-    user = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
-    if not user:
+    content = await _build_open_positions(message.from_user.id, session)
+    if content is None:
         await message.answer("Сначала отправь /start", reply_markup=main_menu())
         return
-    if user.phone_verified_at is None:
-        from bot.keyboards import contact_keyboard
-        await message.answer("Сначала подтверди номер: /start", reply_markup=contact_keyboard())
+    text, markup = content
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+@router.callback_query(F.data == "nav:positions")
+async def nav_positions_refresh(callback: CallbackQuery, session):
+    """Обновить открытые позиции (edit_text на месте)."""
+    if callback.from_user is None:
+        await callback.answer()
         return
+    try:
+        from bot.handlers.trade import trade_state
+        trade_state.pop(callback.from_user.id, None)
+    except Exception:
+        pass
+    if callback.message:
+        content = await _build_open_positions(callback.from_user.id, session)
+        if content is not None:
+            text, markup = content
+            try:
+                await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    await callback.answer()
+
+
+async def _build_open_positions(telegram_id: int, session):
+    """Возвращает (text, markup) или None если юзер/аккаунт не найден."""
+    from db.paper_models import PaperPosition, PositionStatus, TradingAccount
+    from bot.views import fmt_money, fmt_price, format_side
+    from bot.emojis import TG_LONG, TG_SHORT
+
+    user = (await session.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+    if not user:
+        return None
     account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     if not account:
-        await message.answer("Позиций пока нет. Нажми Торговать.", reply_markup=main_menu())
-        return
+        return None
     positions = (
         await session.execute(
             select(PaperPosition).where(PaperPosition.account_id == account.id, PaperPosition.status == PositionStatus.OPEN.value).order_by(PaperPosition.opened_at.desc())
         )
     ).scalars().all()
     if not positions:
-        await message.answer(
-            f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажми Торговать, чтобы открыть.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
-        )
-        return
-    # Build beautiful list for open positions only
-    from bot.emojis import GREEN_ID, RED_ID, tg_emoji
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Посмотреть все сделки", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)],
+        ])
+        return (f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажми Торговать, чтобы открыть.", kb)
 
     lines = [f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b> — {len(positions)}\n"]
     kb_rows = []
     for p in positions:
         side_str = format_side(p.side)
-        # Use premium for side
-        from bot.emojis import TG_LONG, TG_SHORT
-
         side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         pnl = p.unrealized_pnl
         pnl_str = fmt_money(pnl)
-        # Color based on pnl
         pnl_emoji = tg_emoji(GREEN_ID, "🟢") if pnl > 0 else tg_emoji(RED_ID, "🔴") if pnl < 0 else "⚪️"
         lines.append(
             f"{side_tag} <b>{p.symbol} {side_str} x{int(p.leverage)} </b> {pnl_emoji} {pnl_str}\n"
@@ -274,14 +291,10 @@ async def cmd_positions(message: Message, session):
             f"Объём {fmt_money(p.notional)}"
         )
         kb_rows.append([InlineKeyboardButton(text=f"Закрыть {p.symbol}", callback_data=f"close_preview:{p.id}", icon_custom_emoji_id=RED_ID)])
-    kb_rows.append([InlineKeyboardButton(text="Сделки (все)", callback_data="nav:transactions", icon_custom_emoji_id=CHART_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data="nav:positions", icon_custom_emoji_id=GREEN_ID)])
+    kb_rows.append([InlineKeyboardButton(text="Сделки (все)", callback_data="nav:history:0", icon_custom_emoji_id=CHART_ID)])
     kb_rows.append([InlineKeyboardButton(text="Топ", callback_data="nav:top", icon_custom_emoji_id=GOLD_ID)])
-    text = "\n\n".join(lines)
-    await message.answer(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
-    )
+    return ("\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 @router.callback_query(F.data.startswith("nav:top"))
