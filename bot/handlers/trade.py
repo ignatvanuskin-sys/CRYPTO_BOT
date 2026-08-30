@@ -30,6 +30,7 @@ from bot.emojis import (
     SHORT_EMOJI_ID,
     SIREN_ID,
     STAR_ID,
+    TRASH_ID,
     WARNING_ID,
     tg_emoji,
     TG_LONG,
