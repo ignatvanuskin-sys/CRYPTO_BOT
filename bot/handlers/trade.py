@@ -376,18 +376,26 @@ async def handle_trade_text(message: Message, session):
                 await message.answer(f"{TG_WARNING} Значение должно быть положительным числом.", parse_mode=ParseMode.HTML)
                 return
             if is_percent:
-                # Рассчитать от текущей цены
                 snap = await get_display_snapshot(session, state["symbol"])
                 entry_est = snap.ask if state["side"] == "LONG" else snap.bid if snap else None
                 if entry_est is None:
                     await message.answer(f"{TG_WARNING} Цена недоступна, введите точной ценой.", parse_mode=ParseMode.HTML)
                     return
-                pct = val
+                lev = Decimal(state["leverage"])
+                pct = val.copy_abs()
+                # Прибыль в % от маржи: 100% = PnL == margin
+                # Цена = entry * (1 ± pct/(100*leverage))
                 if is_tp_only:
-                    tp = (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001")) if state["side"] == "LONG" else (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                    if state["side"] == "LONG":
+                        tp = (entry_est * (Decimal("1") + pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                    else:
+                        tp = (entry_est * (Decimal("1") - pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                     sl = None
-                else:
-                    sl = (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001")) if state["side"] == "LONG" else (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                else:  # sl_only
+                    if state["side"] == "LONG":
+                        sl = (entry_est * (Decimal("1") - pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                    else:
+                        sl = (entry_est * (Decimal("1") + pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                     tp = None
             else:
                 if is_tp_only:
@@ -395,15 +403,14 @@ async def handle_trade_text(message: Message, session):
                 else:
                     tp, sl = None, val
         else:
-            # Оба: два числа
+            # Оба: два числа — упростим для процентов от прибыли
             if len(parts) != 2:
-                await message.answer(f"{TG_WARNING} Нужны два числа через пробел: TP SL. Например: 180 160 или 5% -3%", parse_mode=ParseMode.HTML)
+                await message.answer(f"{TG_WARNING} Нужны два числа через пробел: TP SL. Например: 180 160 или 5% -3% (процент от прибыли).", parse_mode=ParseMode.HTML)
                 return
             try:
                 v1, v2 = Decimal(parts[0]), Decimal(parts[1])
                 if not v1.is_finite() or not v2.is_finite():
                     raise InvalidOperation
-                # Для процентов — v1/v2 могут быть отрицательными для SL? Для простоты требуем положительные для ценой, для процентов - любые
                 if not is_percent and (v1 <= 0 or v2 <= 0):
                     raise InvalidOperation
             except (InvalidOperation, ValueError):
@@ -415,17 +422,17 @@ async def handle_trade_text(message: Message, session):
                 if entry_est is None:
                     await message.answer(f"{TG_WARNING} Цена недоступна, введите точной ценой.", parse_mode=ParseMode.HTML)
                     return
-                # v1 = TP%, v2 = SL% (может быть отрицательным для SL? Но для простоты: TP +5, SL -3)
-                # Для LONG: TP% положительный = выше, SL% положительный = ниже (передаётся как -3 или 3?)
-                # Принимаем: первое — TP%, второе — SL% (SL% как положительное число — расстояние)
-                # Например: 5 -3  => TP +5%, SL -3% (для LONG: TP 5% выше, SL 3% ниже)
-                # Для SHORT: наоборот
-                def calc(entry, pct, is_tp):
-                    # pct как число: 5 => 5%, -3 => -3%
-                    return (entry * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
-                tp = calc(entry_est, v1, True)
-                sl = calc(entry_est, v2, False)
-                # Валидация: TP/SL должны быть положительными ценами
+                lev = Decimal(state["leverage"])
+                # v1 = TP% прибыли, v2 = SL% убытка (может быть с минусом)
+                # TP всегда прибыль (+), SL всегда убыток (-), берём abs для SL
+                tp_pct = v1.copy_abs()
+                sl_pct = v2.copy_abs()
+                if state["side"] == "LONG":
+                    tp = (entry_est * (Decimal("1") + tp_pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                    sl = (entry_est * (Decimal("1") - sl_pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                else:
+                    tp = (entry_est * (Decimal("1") - tp_pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                    sl = (entry_est * (Decimal("1") + sl_pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                 if tp <= 0 or sl <= 0:
                     await message.answer(f"{TG_WARNING} Рассчитанные цены должны быть >0.", parse_mode=ParseMode.HTML)
                     return
@@ -486,12 +493,19 @@ async def handle_trade_text(message: Message, session):
                 return
             if is_percent:
                 entry_est = pos.entry_price
-                pct = val
+                lev = Decimal(str(pos.leverage or 1))
+                pct = val.copy_abs()
                 if is_tp_only:
-                    tp = (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001")) if format_side(pos.side) == "LONG" else (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                    if format_side(pos.side) == "LONG":
+                        tp = (entry_est * (Decimal("1") + pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                    else:
+                        tp = (entry_est * (Decimal("1") - pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                     sl = pos.stop_loss
                 else:
-                    sl = (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001")) if format_side(pos.side) == "LONG" else (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                    if format_side(pos.side) == "LONG":
+                        sl = (entry_est * (Decimal("1") - pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                    else:
+                        sl = (entry_est * (Decimal("1") + pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                     tp = pos.take_profit
             else:
                 if is_tp_only:
@@ -514,10 +528,16 @@ async def handle_trade_text(message: Message, session):
                 return
             if is_percent:
                 entry_est = pos.entry_price
-                def calc(entry, pct):
-                    return (entry * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
-                tp = calc(entry_est, v1)
-                sl = calc(entry_est, v2)
+                lev = Decimal(str(pos.leverage or 1))
+                def calc_profit(entry, pct, is_tp):
+                    # Процент от прибыли: 100% = PnL == margin
+                    pct_abs = pct.copy_abs()
+                    if (is_tp and format_side(pos.side) == "LONG") or (not is_tp and format_side(pos.side) == "SHORT"):
+                        return (entry * (Decimal("1") + pct_abs / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                    else:
+                        return (entry * (Decimal("1") - pct_abs / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
+                tp = calc_profit(entry_est, v1, True)
+                sl = calc_profit(entry_est, v2, False)
                 if tp <= 0 or sl <= 0:
                     await message.answer(f"{TG_WARNING} Рассчитанные цены должны быть >0.", parse_mode=ParseMode.HTML)
                     return
