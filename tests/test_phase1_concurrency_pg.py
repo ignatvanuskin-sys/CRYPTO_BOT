@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from db.competition_models import Competition, CompetitionStatus, Execution
+from db.competition_models import Competition, CompetitionStatus, Execution, ExecutionReason
 from db.models import User
 from db.paper_models import (
     AccountLedger,
@@ -193,12 +193,16 @@ async def test_pg_concurrent_close_same_key_single_effect(pg_engine):
                 AccountLedger.type == LedgerType.TRADE_CLOSE.value,
             )
         )).scalar_one()
-        execution_count = (await session.execute(
-            select(func.count()).select_from(Execution).where(Execution.position_id == pos_id)
+        # Exactly one CLOSE execution (OPEN execution is a separate immutable record)
+        close_execution_count = (await session.execute(
+            select(func.count()).select_from(Execution).where(
+                Execution.position_id == pos_id,
+                Execution.execution_reason == ExecutionReason.MANUAL_CLOSE.value,
+            )
         )).scalar_one()
         assert close_order_count == 1, f"close orders={close_order_count}"
         assert close_ledger_count == 1, f"TRADE_CLOSE ledgers={close_ledger_count}"
-        assert execution_count == 1, f"executions={execution_count}"
+        assert close_execution_count == 1, f"MANUAL_CLOSE executions={close_execution_count}"
         pos = await session.get(PaperPosition, pos_id)
         assert pos.status == PositionStatus.CLOSED.value
     await _assert_pg_reconciliation(pg_engine, account_id)
