@@ -38,6 +38,7 @@ from bot.emojis import (
 )
 from bot.views import back_keyboard, bingx_chart_url, btn, fmt_money, fmt_price, format_side, get_display_snapshot
 from config import settings
+from db.competition_models import Competition, CompetitionStatus
 from db.models import User
 from db.paper_models import Instrument, PaperPosition, PositionStatus, TradingAccount
 from services.accounts import ensure_can_trade
@@ -369,11 +370,12 @@ async def handle_trade_text(message: Message, session):
                 await message.answer(f"{TG_WARNING} Введите одно число для {'TP' if is_tp_only else 'SL'}.", parse_mode=ParseMode.HTML)
                 return
             try:
+                # Знак игнорируется: "-5", "5", "5%", "-5%" — все означают магнитуду 5 (Phase 1 FIX #1)
                 val = Decimal(parts[0])
-                if not val.is_finite() or val <= 0:
+                if not val.is_finite() or val == 0:
                     raise InvalidOperation
             except (InvalidOperation, ValueError):
-                await message.answer(f"{TG_WARNING} Значение должно быть положительным числом.", parse_mode=ParseMode.HTML)
+                await message.answer(f"{TG_WARNING} Введите число больше нуля, например: 5", parse_mode=ParseMode.HTML)
                 return
             if is_percent:
                 snap = await get_display_snapshot(session, state["symbol"])
@@ -382,7 +384,10 @@ async def handle_trade_text(message: Message, session):
                     await message.answer(f"{TG_WARNING} Цена недоступна, введите точной ценой.", parse_mode=ParseMode.HTML)
                     return
                 lev = Decimal(state["leverage"])
-                pct = val.copy_abs()
+                if lev <= 0:
+                    await message.answer(f"{TG_WARNING} Некорректное плечо.", parse_mode=ParseMode.HTML)
+                    return
+                pct = val.copy_abs()  # знак игнорируется: -5% = 5%
                 # Прибыль в % от маржи: 100% = PnL == margin
                 # Цена = entry * (1 ± pct/(100*leverage))
                 if is_tp_only:
@@ -398,6 +403,10 @@ async def handle_trade_text(message: Message, session):
                         sl = (entry_est * (Decimal("1") + pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                     tp = None
             else:
+                # Точная цена — должна быть положительной
+                if val <= 0:
+                    await message.answer(f"{TG_WARNING} Цена должна быть положительным числом.", parse_mode=ParseMode.HTML)
+                    return
                 if is_tp_only:
                     tp, sl = val, None
                 else:
@@ -423,10 +432,15 @@ async def handle_trade_text(message: Message, session):
                     await message.answer(f"{TG_WARNING} Цена недоступна, введите точной ценой.", parse_mode=ParseMode.HTML)
                     return
                 lev = Decimal(state["leverage"])
-                # v1 = TP% прибыли, v2 = SL% убытка (может быть с минусом)
-                # TP всегда прибыль (+), SL всегда убыток (-), берём abs для SL
+                if lev <= 0:
+                    await message.answer(f"{TG_WARNING} Некорректное плечо.", parse_mode=ParseMode.HTML)
+                    return
+                # v1 = TP% прибыли, v2 = SL% убытка — знак игнорируется, берём магнитуду
                 tp_pct = v1.copy_abs()
                 sl_pct = v2.copy_abs()
+                if tp_pct == 0 or sl_pct == 0:
+                    await message.answer(f"{TG_WARNING} Проценты должны быть больше нуля.", parse_mode=ParseMode.HTML)
+                    return
                 if state["side"] == "LONG":
                     tp = (entry_est * (Decimal("1") + tp_pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                     sl = (entry_est * (Decimal("1") - sl_pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
@@ -453,19 +467,43 @@ async def handle_trade_text(message: Message, session):
     if step.startswith("edit_"):
         # step: edit_tp_sl_price, edit_tp_sl_percent, edit_tp_only, edit_sl_only, edit_tp_only_percent, edit_sl_only_percent
         text = (message.text or "").strip()
+        pos_id = state.get("editing_position_id")
+        # FIX #4 IDOR: запрашиваем позицию только по владению и только OPEN
+        user = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
+        account = (
+            await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
+        ).scalar_one_or_none() if user else None
+        if account is None or not pos_id:
+            await message.answer(f"{TG_WARNING} Позиция не найдена.", parse_mode=ParseMode.HTML)
+            trade_state.pop(message.from_user.id, None)
+            return
+        pos = (await session.execute(
+            select(PaperPosition).where(
+                PaperPosition.id == int(pos_id),
+                PaperPosition.account_id == account.id,
+            )
+        )).scalar_one_or_none()
+        if pos is None or pos.status != PositionStatus.OPEN.value:
+            await message.answer(f"{TG_WARNING} Позиция не найдена или уже закрыта.", parse_mode=ParseMode.HTML)
+            trade_state.pop(message.from_user.id, None)
+            return
+        # competition isolation: позиция должна быть в tradeable-турнире
+        if pos.competition_id is not None:
+            comp = await session.get(Competition, pos.competition_id)
+            if comp is None or comp.status != CompetitionStatus.ACTIVE.value:
+                await message.answer(f"{TG_WARNING} Турнир уже завершён.", parse_mode=ParseMode.HTML)
+                trade_state.pop(message.from_user.id, None)
+                return
         if text.lower() == "skip":
             # Убрать оба
-            pos_id = state.get("editing_position_id")
-            pos = await session.get(PaperPosition, pos_id) if pos_id else None
-            if pos:
-                try:
-                    from services.paper_adapter import update_position_tp_sl
-                    await update_position_tp_sl(session, pos, None, None)
-                    await session.commit()
-                    await message.answer(f"{TG_CHECK} TP/SL убраны для {pos.symbol}.", parse_mode=ParseMode.HTML)
-                except Exception as exc:
-                    await session.rollback()
-                    await message.answer(_strip_tags(safe_trade_error(exc)), parse_mode=ParseMode.HTML)
+            try:
+                from services.paper_adapter import update_position_tp_sl
+                await update_position_tp_sl(session, pos, account, None, None)
+                await session.commit()
+                await message.answer(f"{TG_CHECK} TP/SL убраны для {pos.symbol}.", parse_mode=ParseMode.HTML)
+            except Exception as exc:
+                await session.rollback()
+                await message.answer(_strip_tags(safe_trade_error(exc)), parse_mode=ParseMode.HTML)
             trade_state.pop(message.from_user.id, None)
             return
         # Определяем режим
@@ -474,26 +512,24 @@ async def handle_trade_text(message: Message, session):
         is_sl_only = "sl_only" in step
         clean = text.replace("%", " ").replace(",", " ").strip()
         parts = clean.split()
-        pos_id = state.get("editing_position_id")
-        pos = await session.get(PaperPosition, pos_id) if pos_id else None
-        if not pos:
-            await message.answer(f"{TG_WARNING} Позиция не найдена.", parse_mode=ParseMode.HTML)
-            trade_state.pop(message.from_user.id, None)
-            return
         if is_tp_only or is_sl_only:
             if len(parts) != 1:
                 await message.answer(f"{TG_WARNING} Введите одно число для {'TP' if is_tp_only else 'SL'}.", parse_mode=ParseMode.HTML)
                 return
             try:
+                # Знак игнорируется для процентов (FIX #1), цена должна быть >0
                 val = Decimal(parts[0])
-                if not val.is_finite() or val <= 0:
+                if not val.is_finite() or val == 0:
                     raise InvalidOperation
             except (InvalidOperation, ValueError):
-                await message.answer(f"{TG_WARNING} Значение должно быть положительным числом.", parse_mode=ParseMode.HTML)
+                await message.answer(f"{TG_WARNING} Введите число больше нуля.", parse_mode=ParseMode.HTML)
                 return
             if is_percent:
                 entry_est = pos.entry_price
                 lev = Decimal(str(pos.leverage or 1))
+                if lev <= 0:
+                    await message.answer(f"{TG_WARNING} Некорректное плечо.", parse_mode=ParseMode.HTML)
+                    return
                 pct = val.copy_abs()
                 if is_tp_only:
                     if format_side(pos.side) == "LONG":
@@ -508,6 +544,9 @@ async def handle_trade_text(message: Message, session):
                         sl = (entry_est * (Decimal("1") + pct / (Decimal("100") * lev))).quantize(Decimal("0.00000001"))
                     tp = pos.take_profit
             else:
+                if val <= 0:
+                    await message.answer(f"{TG_WARNING} Цена должна быть положительным числом.", parse_mode=ParseMode.HTML)
+                    return
                 if is_tp_only:
                     tp, sl = val, pos.stop_loss
                 else:
@@ -529,6 +568,14 @@ async def handle_trade_text(message: Message, session):
             if is_percent:
                 entry_est = pos.entry_price
                 lev = Decimal(str(pos.leverage or 1))
+                if lev <= 0:
+                    await message.answer(f"{TG_WARNING} Некорректное плечо.", parse_mode=ParseMode.HTML)
+                    return
+                tp_pct = v1.copy_abs()
+                sl_pct = v2.copy_abs()
+                if tp_pct == 0 or sl_pct == 0:
+                    await message.answer(f"{TG_WARNING} Проценты должны быть больше нуля.", parse_mode=ParseMode.HTML)
+                    return
                 def calc_profit(entry, pct, is_tp):
                     # Процент от прибыли: 100% = PnL == margin
                     pct_abs = pct.copy_abs()
@@ -548,7 +595,7 @@ async def handle_trade_text(message: Message, session):
                     return
         try:
             from services.paper_adapter import update_position_tp_sl
-            await update_position_tp_sl(session, pos, tp, sl)
+            await update_position_tp_sl(session, pos, account, tp, sl)
             await session.commit()
             await message.answer(
                 f"{TG_CHECK} <b>TP/SL ОБНОВЛЕНЫ</b>\n\n{pos.symbol} {format_side(pos.side)} x{pos.leverage:g}\n"
@@ -1035,16 +1082,12 @@ async def cb_edit_tp_sl(callback: CallbackQuery, session):
     except ValueError:
         await callback.answer("Позиция не найдена", show_alert=True)
         return
-    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
-    account = (
-        await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
-    ).scalar_one_or_none() if user else None
-    position = await session.get(PaperPosition, pos_id) if account else None
-    if not position or position.account_id != account.id:
+    position = await _get_owned_open_position(session, callback.from_user.id, pos_id)
+    if position is None:
         await callback.answer("Позиция не найдена", show_alert=True)
         return
-    if position.status != PositionStatus.OPEN.value:
-        await callback.answer("Позиция уже закрыта", show_alert=True)
+    if not await _competition_tradeable(session, position):
+        await callback.answer("Турнир уже завершён", show_alert=True)
         return
     # Сохраняем position_id для редактирования
     trade_state[callback.from_user.id] = {
@@ -1075,6 +1118,38 @@ async def cb_edit_tp_sl(callback: CallbackQuery, session):
     await callback.answer()
 
 
+async def _get_owned_open_position(session, telegram_id: int, pos_id: int) -> PaperPosition | None:
+    """FIX #4 IDOR: вернуть позицию только если она принадлежит аккаунту текущего юзера и открыта."""
+    user = (await session.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+    account = (
+        await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
+    ).scalar_one_or_none() if user else None
+    if account is None:
+        return None
+    return (
+        await session.execute(
+            select(PaperPosition).where(
+                PaperPosition.id == pos_id,
+                PaperPosition.account_id == account.id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _competition_tradeable(session, position: PaperPosition) -> bool:
+    """Проверка изоляции турнира: позиция должна быть в активном, торговом турнире."""
+    if position.competition_id is None:
+        return True
+    comp = await session.get(Competition, position.competition_id)
+    if comp is None:
+        return False
+    if comp.status != CompetitionStatus.ACTIVE.value:
+        return False
+    if comp.ends_at <= datetime.now(timezone.utc):
+        return False
+    return True
+
+
 @router.callback_query(F.data.startswith("edit_tp_sl:mode:"))
 async def cb_edit_tp_sl_mode(callback: CallbackQuery, session):
     if callback.from_user is None or callback.message is None:
@@ -1086,17 +1161,14 @@ async def cb_edit_tp_sl_mode(callback: CallbackQuery, session):
     except ValueError:
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    state = trade_state.get(callback.from_user.id, {})
-    if not state.get("editing_position_id") or state["editing_position_id"] != pos_id:
-        # Инициализируем если нет
-        pos = await session.get(PaperPosition, pos_id)
-        if not pos:
-            await callback.answer("Позиция не найдена", show_alert=True)
-            return
-        trade_state[callback.from_user.id] = {"editing_position_id": pos_id, "symbol": pos.symbol, "side": format_side(pos.side), "awaiting": f"edit_tp_sl_{mode}", "mode": mode}
-    else:
-        trade_state[callback.from_user.id]["awaiting"] = f"edit_tp_sl_{mode}"
-        trade_state[callback.from_user.id]["mode"] = mode
+    pos = await _get_owned_open_position(session, callback.from_user.id, pos_id)
+    if pos is None:
+        await callback.answer("Позиция не найдена", show_alert=True)
+        return
+    if not await _competition_tradeable(session, pos):
+        await callback.answer("Турнир уже завершён", show_alert=True)
+        return
+    trade_state[callback.from_user.id] = {"editing_position_id": pos_id, "symbol": pos.symbol, "side": format_side(pos.side), "awaiting": f"edit_tp_sl_{mode}", "mode": mode}
     await callback.message.edit_text(
         f"{TG_STAR} <b>ВВЕДИТЕ TP И SL — {'ТОЧНОЙ ЦЕНОЙ' if mode == 'price' else 'В ПРОЦЕНТАХ'}</b>\n\n"
         f"Два числа через пробел, например: {'180 160' if mode == 'price' else '5 -3  (TP +5%, SL -3%)'}\n"
@@ -1130,9 +1202,12 @@ async def cb_edit_tp_sl_only(callback: CallbackQuery, session):
     except ValueError:
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    pos = await session.get(PaperPosition, pos_id)
-    if not pos:
+    pos = await _get_owned_open_position(session, callback.from_user.id, pos_id)
+    if pos is None:
         await callback.answer("Позиция не найдена", show_alert=True)
+        return
+    if not await _competition_tradeable(session, pos):
+        await callback.answer("Турнир уже завершён", show_alert=True)
         return
     trade_state[callback.from_user.id] = {"editing_position_id": pos_id, "symbol": pos.symbol, "side": format_side(pos.side), "awaiting": awaiting, "mode": mode}
     await callback.message.edit_text(
@@ -1158,15 +1233,18 @@ async def cb_edit_tp_sl_clear(callback: CallbackQuery, session):
     except ValueError:
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
-    account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none() if user else None
-    position = await session.get(PaperPosition, pos_id) if account else None
-    if not position or position.account_id != account.id:
+    position = await _get_owned_open_position(session, callback.from_user.id, pos_id)
+    if position is None:
         await callback.answer("Позиция не найдена", show_alert=True)
         return
+    if not await _competition_tradeable(session, position):
+        await callback.answer("Турнир уже завершён", show_alert=True)
+        return
+    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
+    account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none() if user else None
     try:
         from services.paper_adapter import update_position_tp_sl
-        await update_position_tp_sl(session, position, None, None)
+        await update_position_tp_sl(session, position, account, None, None)
         await session.commit()
         await callback.message.edit_text(
             f"{TG_CHECK} <b>TP/SL УБРАНЫ</b>\n\n{position.symbol} {format_side(position.side)} x{position.leverage:g}\n"

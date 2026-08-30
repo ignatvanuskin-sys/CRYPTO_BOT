@@ -334,30 +334,36 @@ async def open_position(
                 )
                 session.add(execution)
                 await session.flush()
+
+            # Reserve the required margin, add the ledger entry, and reconcile
+            # stats INSIDE the same savepoint as the order+position+execution.
+            # Phase 1 FIX #3: idempotency visibility and financial state must
+            # commit atomically — a concurrent duplicate key rolls back the
+            # WHOLE savepoint (including ledger/account) and resolves to the
+            # canonical position below.
+            account.cash_balance = (account.cash_balance - required_margin).quantize(Decimal("0.01"))
+            account.margin_used = (account.margin_used + required_margin).quantize(Decimal("0.01"))
+            ledger = AccountLedger(
+                account_id=account.id,
+                type=LedgerType.TRADE_OPEN.value,
+                amount=-required_margin,
+                balance_after=account.cash_balance,
+                reference_type="position",
+                reference_id=str(position.id),
+                idempotency_key=f"{idempotency_key}:ledger" if idempotency_key else f"open:{position.id}",
+            )
+            session.add(ledger)
+            await session.flush()
+
+            # update account stats (inside savepoint — reconcilable atomically)
+            from services.trading_account import refresh_account_stats
+
+            await refresh_account_stats(session, account)
     except IntegrityError:
+        # Duplicate idempotency key: savepoint rolled back EVERYTHING including
+        # the ledger/account changes above, so we can safely resolve to the
+        # canonical position without double-mutating financial state.
         return await _resolve_idempotent_position(session, idempotency_key, account, symbol, side)
-
-    # Reserve the required margin in the paper account. `refresh_account_stats`
-    # reconciles equity and available margin from this state.
-    account.cash_balance = (account.cash_balance - required_margin).quantize(Decimal("0.01"))
-    account.margin_used = (account.margin_used + required_margin).quantize(Decimal("0.01"))
-
-    # ledger
-    ledger = AccountLedger(
-        account_id=account.id,
-        type=LedgerType.TRADE_OPEN.value,
-        amount=-required_margin,
-        balance_after=account.cash_balance,
-        reference_type="position",
-        reference_id=str(position.id),
-        idempotency_key=f"{idempotency_key}:ledger" if idempotency_key else f"open:{position.id}",
-    )
-    session.add(ledger)
-
-    # update account stats
-    from services.trading_account import refresh_account_stats
-
-    await refresh_account_stats(session, account)
 
     await session.flush()
     increment("trade_opened")
@@ -415,7 +421,11 @@ async def close_position(
     gross = calc_pnl(position.side, position.entry_price, close_price, position.quantity)
     net = gross - position.fee_open - position.fee_close
 
-    # create close order (savepoint-guarded against a concurrent duplicate key)
+    # create close order + update position + ledger + account inside ONE
+    # savepoint (Phase 1 FIX #3: idempotency visibility and financial state
+    # commit atomically — a concurrent duplicate key rolls back the WHOLE
+    # savepoint including ledger/account and resolves to the closed position).
+    gap_amount = Decimal("0.00")
     try:
         async with session.begin_nested():
             order = PaperOrder(
@@ -433,6 +443,107 @@ async def close_position(
             )
             session.add(order)
             await session.flush()
+
+            # update position
+            position.status = PositionStatus.CLOSED.value
+            position.current_price = close_price
+            position.realized_pnl = net
+            position.unrealized_pnl = Decimal("0")
+            position.closed_at = datetime.now(timezone.utc)
+            position.updated_at = datetime.now(timezone.utc)
+
+            # immutable execution for close
+            # map reason to ExecutionReason
+            reason_map = {
+                "manual": ExecutionReason.MANUAL_CLOSE.value,
+                "TP": ExecutionReason.TAKE_PROFIT.value,
+                "SL": ExecutionReason.STOP_LOSS.value,
+                "LIQUIDATION": ExecutionReason.LIQUIDATION.value,
+            }
+            exec_reason = reason_map.get(reason, ExecutionReason.MANUAL_CLOSE.value)
+            # competition_id from position or active
+            comp_id = getattr(position, 'competition_id', None)
+            if comp_id is None:
+                from db.competition_models import CompetitionParticipant
+                res = await session.execute(select(CompetitionParticipant).where(CompetitionParticipant.user_id == account.user_id).order_by(CompetitionParticipant.joined_at.desc()).limit(1))
+                part = res.scalar_one_or_none()
+                if part:
+                    comp_id = part.competition_id
+            if comp_id is not None:
+                execution = Execution(
+                    position_id=position.id,
+                    user_id=account.user_id,
+                    competition_id=comp_id,
+                    symbol=position.symbol,
+                    side=position.side,
+                    price_source="BINGX",
+                    market_type="USD_M_PERPETUAL",
+                    bid_price=snap_bid,
+                    ask_price=snap_ask,
+                    execution_price=close_price,
+                    quantity=position.quantity,
+                    notional=calc_notional(close_price, position.quantity),
+                    market_timestamp=snap_ts,
+                    requested_at=requested_at_close,
+                    executed_at=datetime.now(timezone.utc),
+                    execution_reason=exec_reason,
+                )
+                session.add(execution)
+                await session.flush()
+
+            # ledger: return margin + pnl
+            # cash was deducted at open by the required margin (notional / leverage),
+            # now we return that margin plus the realized PnL.
+            returned_margin = (position.notional / Decimal(str(position.leverage or 1))).quantize(Decimal("0.01"))
+            return_amount = (returned_margin + net).quantize(Decimal("0.01"))
+            # Safety cap (Phase 1 FIX #2): loss beyond margin is absorbed by the
+            # house; record it as an explicit, auditable zero-amount ADJUSTMENT
+            # ledger entry INSIDE the same savepoint so:
+            #   - account balance and ledger sum remain reconcilable (amount 0)
+            #   - the capped loss is fully auditable (reference_id + a marker)
+            #   - no money silently appears or disappears
+            if return_amount < 0:
+                # gap_amount = -(margins missed). We never move cash by it
+                # (that would violate CHECK balance_after>=0), but we audit it.
+                gap_amount = (-return_amount).quantize(Decimal("0.01"))
+                net = -returned_margin
+                return_amount = Decimal("0.00")
+                position.realized_pnl = net
+            account.cash_balance = (account.cash_balance + return_amount).quantize(Decimal("0.01"))
+            account.margin_used = (account.margin_used - returned_margin).quantize(Decimal("0.01"))
+            if account.margin_used < 0:
+                account.margin_used = Decimal("0")
+            account.realized_pnl = (account.realized_pnl + net).quantize(Decimal("0.01"))
+            # unrealized will be recalculated elsewhere
+            ledger = AccountLedger(
+                account_id=account.id,
+                type=LedgerType.TRADE_CLOSE.value,
+                amount=return_amount,
+                balance_after=account.cash_balance,
+                reference_type="position",
+                reference_id=str(position.id),
+                idempotency_key=f"{idempotency_key}:ledger" if idempotency_key else f"close-ledger:{position.id}",
+            )
+            session.add(ledger)
+            if gap_amount > 0:
+                # Explicit auditable ADJUSTMENT: amount 0 (no cash movement) but
+                # records the absorbed gap. Idempotent via unique key tied to
+                # this close operation's idempotency key.
+                gap_ledger = AccountLedger(
+                    account_id=account.id,
+                    type=LedgerType.ADJUSTMENT.value,
+                    amount=Decimal("0.00"),
+                    balance_after=account.cash_balance,
+                    reference_type="liquidation_gap",
+                    reference_id=f"{position.id}:gap={gap_amount}",
+                    idempotency_key=f"{idempotency_key}:gap" if idempotency_key else f"gap:{position.id}",
+                )
+                session.add(gap_ledger)
+                increment("liquidation_gap_capped")
+
+            from services.trading_account import refresh_account_stats
+            # Reconcile remaining open-position unrealized PnL and equity.
+            await refresh_account_stats(session, account)
     except IntegrityError:
         existing_order = (
             await session.execute(select(PaperOrder).where(PaperOrder.idempotency_key == idempotency_key))
@@ -441,85 +552,6 @@ async def close_position(
             return position, position.realized_pnl
         raise
 
-    # update position
-    position.status = PositionStatus.CLOSED.value
-    position.current_price = close_price
-    position.realized_pnl = net
-    position.unrealized_pnl = Decimal("0")
-    position.closed_at = datetime.now(timezone.utc)
-    position.updated_at = datetime.now(timezone.utc)
-
-    # immutable execution for close
-    # map reason to ExecutionReason
-    reason_map = {
-        "manual": ExecutionReason.MANUAL_CLOSE.value,
-        "TP": ExecutionReason.TAKE_PROFIT.value,
-        "SL": ExecutionReason.STOP_LOSS.value,
-        "LIQUIDATION": ExecutionReason.LIQUIDATION.value,
-    }
-    exec_reason = reason_map.get(reason, ExecutionReason.MANUAL_CLOSE.value)
-    # competition_id from position or active
-    comp_id = getattr(position, 'competition_id', None)
-    if comp_id is None:
-        from db.competition_models import CompetitionParticipant
-        res = await session.execute(select(CompetitionParticipant).where(CompetitionParticipant.user_id == account.user_id).order_by(CompetitionParticipant.joined_at.desc()).limit(1))
-        part = res.scalar_one_or_none()
-        if part:
-            comp_id = part.competition_id
-    if comp_id is not None:
-        execution = Execution(
-            position_id=position.id,
-            user_id=account.user_id,
-            competition_id=comp_id,
-            symbol=position.symbol,
-            side=position.side,
-            price_source="BINGX",
-            market_type="USD_M_PERPETUAL",
-            bid_price=snap_bid,
-            ask_price=snap_ask,
-            execution_price=close_price,
-            quantity=position.quantity,
-            notional=calc_notional(close_price, position.quantity),
-            market_timestamp=snap_ts,
-            requested_at=requested_at_close,
-            executed_at=datetime.now(timezone.utc),
-            execution_reason=exec_reason,
-        )
-        session.add(execution)
-        await session.flush()
-
-    # ledger: return margin + pnl
-    # cash was deducted at open by the required margin (notional / leverage),
-    # now we return that margin plus the realized PnL.
-    returned_margin = (position.notional / Decimal(str(position.leverage or 1))).quantize(Decimal("0.01"))
-    return_amount = (returned_margin + net).quantize(Decimal("0.01"))
-    # Safety cap: prevent negative return (would violate CHECK balance_after>=0)
-    # Real liquidation should close before this, but cap as last resort
-    if return_amount < 0:
-        # Cap loss at margin
-        net = -returned_margin
-        return_amount = Decimal("0.00")
-        position.realized_pnl = net
-    account.cash_balance = (account.cash_balance + return_amount).quantize(Decimal("0.01"))
-    account.margin_used = (account.margin_used - returned_margin).quantize(Decimal("0.01"))
-    if account.margin_used < 0:
-        account.margin_used = Decimal("0")
-    account.realized_pnl = (account.realized_pnl + net).quantize(Decimal("0.01"))
-    # unrealized will be recalculated elsewhere
-    ledger = AccountLedger(
-        account_id=account.id,
-        type=LedgerType.TRADE_CLOSE.value,
-        amount=return_amount,
-        balance_after=account.cash_balance,
-        reference_type="position",
-        reference_id=str(position.id),
-        idempotency_key=f"{idempotency_key}:ledger" if idempotency_key else f"close-ledger:{position.id}",
-    )
-    session.add(ledger)
-
-    from services.trading_account import refresh_account_stats
-    # Reconcile remaining open-position unrealized PnL and equity.
-    await refresh_account_stats(session, account)
     await session.flush()
     increment("trade_closed")
     return position, net
@@ -528,12 +560,19 @@ async def close_position(
 async def update_position_tp_sl(
     session,
     position: PaperPosition,
+    account: TradingAccount,
     take_profit: Decimal | None,
     stop_loss: Decimal | None,
 ) -> PaperPosition:
-    """Обновить TP/SL у открытой позиции."""
+    """Обновить TP/SL у открытой позиции.
+
+    Phase 1 FIX #4: серверно проверяем владение позицией (IDOR) и что
+    позиция всё ещё открыта и принадлежит переданному аккаунту.
+    """
     if position.status != PositionStatus.OPEN.value:
         raise PaperError("Position not open")
+    if account is None or position.account_id != account.id:
+        raise PaperError("Position does not belong to account")
     _validate_tp_sl(position.side, position.entry_price, take_profit, stop_loss)
     position.take_profit = take_profit
     position.stop_loss = stop_loss
