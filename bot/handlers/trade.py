@@ -441,6 +441,106 @@ async def handle_trade_text(message: Message, session):
         await _show_confirmation(message, st, session)
         return
 
+    # --- Шаг: редактирование TP/SL открытой позиции ---
+    if step.startswith("edit_"):
+        # step: edit_tp_sl_price, edit_tp_sl_percent, edit_tp_only, edit_sl_only, edit_tp_only_percent, edit_sl_only_percent
+        text = (message.text or "").strip()
+        if text.lower() == "skip":
+            # Убрать оба
+            pos_id = state.get("editing_position_id")
+            pos = await session.get(PaperPosition, pos_id) if pos_id else None
+            if pos:
+                try:
+                    from services.paper_adapter import update_position_tp_sl
+                    await update_position_tp_sl(session, pos, None, None)
+                    await session.commit()
+                    await message.answer(f"{TG_CHECK} TP/SL убраны для {pos.symbol}.", parse_mode=ParseMode.HTML)
+                except Exception as exc:
+                    await session.rollback()
+                    await message.answer(_strip_tags(safe_trade_error(exc)), parse_mode=ParseMode.HTML)
+            trade_state.pop(message.from_user.id, None)
+            return
+        # Определяем режим
+        is_percent = "percent" in step or "%" in text
+        is_tp_only = "tp_only" in step
+        is_sl_only = "sl_only" in step
+        clean = text.replace("%", " ").replace(",", " ").strip()
+        parts = clean.split()
+        pos_id = state.get("editing_position_id")
+        pos = await session.get(PaperPosition, pos_id) if pos_id else None
+        if not pos:
+            await message.answer(f"{TG_WARNING} Позиция не найдена.", parse_mode=ParseMode.HTML)
+            trade_state.pop(message.from_user.id, None)
+            return
+        if is_tp_only or is_sl_only:
+            if len(parts) != 1:
+                await message.answer(f"{TG_WARNING} Введите одно число для {'TP' if is_tp_only else 'SL'}.", parse_mode=ParseMode.HTML)
+                return
+            try:
+                val = Decimal(parts[0])
+                if not val.is_finite() or val <= 0:
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                await message.answer(f"{TG_WARNING} Значение должно быть положительным числом.", parse_mode=ParseMode.HTML)
+                return
+            if is_percent:
+                entry_est = pos.entry_price
+                pct = val
+                if is_tp_only:
+                    tp = (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001")) if format_side(pos.side) == "LONG" else (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                    sl = pos.stop_loss
+                else:
+                    sl = (entry_est * (Decimal("1") - pct/Decimal("100"))).quantize(Decimal("0.00000001")) if format_side(pos.side) == "LONG" else (entry_est * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                    tp = pos.take_profit
+            else:
+                if is_tp_only:
+                    tp, sl = val, pos.stop_loss
+                else:
+                    tp, sl = pos.take_profit, val
+        else:
+            # Оба
+            if len(parts) != 2:
+                await message.answer(f"{TG_WARNING} Нужны два числа через пробел: TP SL.", parse_mode=ParseMode.HTML)
+                return
+            try:
+                v1, v2 = Decimal(parts[0]), Decimal(parts[1])
+                if not v1.is_finite() or not v2.is_finite():
+                    raise InvalidOperation
+                if not is_percent and (v1 <= 0 or v2 <= 0):
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                await message.answer(f"{TG_WARNING} Значения должны быть числами.", parse_mode=ParseMode.HTML)
+                return
+            if is_percent:
+                entry_est = pos.entry_price
+                def calc(entry, pct):
+                    return (entry * (Decimal("1") + pct/Decimal("100"))).quantize(Decimal("0.00000001"))
+                tp = calc(entry_est, v1)
+                sl = calc(entry_est, v2)
+                if tp <= 0 or sl <= 0:
+                    await message.answer(f"{TG_WARNING} Рассчитанные цены должны быть >0.", parse_mode=ParseMode.HTML)
+                    return
+            else:
+                tp, sl = v1, v2
+                if tp <= 0 or sl <= 0:
+                    await message.answer(f"{TG_WARNING} TP и SL должны быть >0.", parse_mode=ParseMode.HTML)
+                    return
+        try:
+            from services.paper_adapter import update_position_tp_sl
+            await update_position_tp_sl(session, pos, tp, sl)
+            await session.commit()
+            await message.answer(
+                f"{TG_CHECK} <b>TP/SL ОБНОВЛЕНЫ</b>\n\n{pos.symbol} {format_side(pos.side)} x{pos.leverage:g}\n"
+                f"TP: {fmt_price(tp) if tp else 'нет'} → SL: {fmt_price(sl) if sl else 'нет'}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("Назад", "nav:transactions:0", icon=PIN_ID)]]),
+            )
+        except Exception as exc:
+            await session.rollback()
+            await message.answer(_strip_tags(safe_trade_error(exc)), parse_mode=ParseMode.HTML)
+        trade_state.pop(message.from_user.id, None)
+        return
+
 
 async def _show_confirmation(message: Message, state: dict, session):
     symbol = state["symbol"]
@@ -902,3 +1002,161 @@ async def cb_close_confirm(callback: CallbackQuery, session):
         await callback.answer(plain[:200], show_alert=True)
         if callback.message:
             await callback.message.edit_text(html_text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard("nav:transactions"))
+
+
+@router.callback_query(F.data.regexp(r"^edit_tp_sl:\d+$"))
+async def cb_edit_tp_sl(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
+    try:
+        pos_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Позиция не найдена", show_alert=True)
+        return
+    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
+    account = (
+        await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
+    ).scalar_one_or_none() if user else None
+    position = await session.get(PaperPosition, pos_id) if account else None
+    if not position or position.account_id != account.id:
+        await callback.answer("Позиция не найдена", show_alert=True)
+        return
+    if position.status != PositionStatus.OPEN.value:
+        await callback.answer("Позиция уже закрыта", show_alert=True)
+        return
+    # Сохраняем position_id для редактирования
+    trade_state[callback.from_user.id] = {
+        "editing_position_id": pos_id,
+        "symbol": position.symbol,
+        "side": format_side(position.side),
+        "awaiting": "edit_tp_sl_choice",
+    }
+    current_tp = fmt_price(position.take_profit) if position.take_profit else "нет"
+    current_sl = fmt_price(position.stop_loss) if position.stop_loss else "нет"
+    await callback.message.edit_text(
+        f"{TG_STAR} <b>РЕДАКТОР TP/SL</b>\n\n"
+        f"{position.symbol} {TG_LONG if format_side(position.side) == 'LONG' else TG_SHORT} {format_side(position.side)} x{position.leverage:g}\n"
+        f"Вход: {fmt_price(position.entry_price)} → Сейчас: {fmt_price(position.current_price)}\n"
+        f"Текущий TP: {current_tp}\n"
+        f"Текущий SL: {current_sl}\n\n"
+        f"Выберите как изменить:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [btn("Точной ценой", f"edit_tp_sl:mode:price:{pos_id}", icon=STAR_ID, style="primary"), btn("В процентах", f"edit_tp_sl:mode:percent:{pos_id}", icon=STAR_ID, style="primary")],
+                [btn("Только TP", f"edit_tp_sl:only:tp:{pos_id}", icon=CHECK_ID, style="success"), btn("Только SL", f"edit_tp_sl:only:sl:{pos_id}", icon=CROSS_ID, style="danger")],
+                [btn("Убрать TP/SL", f"edit_tp_sl:clear:{pos_id}", icon=TRASH_ID, style="danger")],
+                [btn("Назад", f"nav:transactions:0", icon=PIN_ID)],
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_tp_sl:mode:"))
+async def cb_edit_tp_sl_mode(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
+    try:
+        _, _, mode, pos_id_str = callback.data.split(":", 3)
+        pos_id = int(pos_id_str)
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    state = trade_state.get(callback.from_user.id, {})
+    if not state.get("editing_position_id") or state["editing_position_id"] != pos_id:
+        # Инициализируем если нет
+        pos = await session.get(PaperPosition, pos_id)
+        if not pos:
+            await callback.answer("Позиция не найдена", show_alert=True)
+            return
+        trade_state[callback.from_user.id] = {"editing_position_id": pos_id, "symbol": pos.symbol, "side": format_side(pos.side), "awaiting": f"edit_tp_sl_{mode}", "mode": mode}
+    else:
+        trade_state[callback.from_user.id]["awaiting"] = f"edit_tp_sl_{mode}"
+        trade_state[callback.from_user.id]["mode"] = mode
+    await callback.message.edit_text(
+        f"{TG_STAR} <b>ВВЕДИТЕ TP И SL — {'ТОЧНОЙ ЦЕНОЙ' if mode == 'price' else 'В ПРОЦЕНТАХ'}</b>\n\n"
+        f"Два числа через пробел, например: {'180 160' if mode == 'price' else '5 -3  (TP +5%, SL -3%)'}\n"
+        f"Можно одно: {'180 — только TP' if mode == 'price' else '5 — только TP'}\n"
+        f"Или <code>skip</code> чтобы убрать оба.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("Назад", f"edit_tp_sl:{pos_id}", icon=PIN_ID)],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_tp_sl:only:"))
+async def cb_edit_tp_sl_only(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
+    try:
+        _, _, only, pos_id_str = callback.data.split(":", 3)
+        pos_id = int(pos_id_str)
+        # Handle tp_percent/sl_percent variants
+        if only in ("tp_percent", "sl_percent"):
+            is_tp = "tp" in only
+            mode = "percent"
+            awaiting = "edit_tp_only_percent" if is_tp else "edit_sl_only_percent"
+        else:
+            is_tp = only == "tp"
+            mode = "price"
+            awaiting = "edit_tp_only" if is_tp else "edit_sl_only"
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    pos = await session.get(PaperPosition, pos_id)
+    if not pos:
+        await callback.answer("Позиция не найдена", show_alert=True)
+        return
+    trade_state[callback.from_user.id] = {"editing_position_id": pos_id, "symbol": pos.symbol, "side": format_side(pos.side), "awaiting": awaiting, "mode": mode}
+    await callback.message.edit_text(
+        f"{TG_STAR} <b>ТОЛЬКО {'TP' if is_tp else 'SL'} — {'В ПРОЦЕНТАХ' if 'percent' in awaiting else 'ТОЧНОЙ ЦЕНОЙ'}</b>\n\n"
+        f"Введите {'цену' if 'price' in awaiting or awaiting in ('edit_tp_only','edit_sl_only') else 'процент'} {'TP' if is_tp else 'SL'}, например: {'180' if 'price' in awaiting else '5%'}\n"
+        f"Или <code>skip</code> чтобы убрать.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("В процентах" if 'price' in awaiting else "Точной ценой", f"edit_tp_sl:only:{'tp_percent' if is_tp else 'sl_percent'}:{pos_id}" if 'price' in awaiting else f"edit_tp_sl:only:{'tp' if is_tp else 'sl'}:{pos_id}", icon=STAR_ID)],
+            [btn("Назад", f"edit_tp_sl:{pos_id}", icon=PIN_ID)],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_tp_sl:clear:"))
+async def cb_edit_tp_sl_clear(callback: CallbackQuery, session):
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
+    try:
+        pos_id = int(callback.data.split(":")[2])
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
+    account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none() if user else None
+    position = await session.get(PaperPosition, pos_id) if account else None
+    if not position or position.account_id != account.id:
+        await callback.answer("Позиция не найдена", show_alert=True)
+        return
+    try:
+        from services.paper_adapter import update_position_tp_sl
+        await update_position_tp_sl(session, position, None, None)
+        await session.commit()
+        await callback.message.edit_text(
+            f"{TG_CHECK} <b>TP/SL УБРАНЫ</b>\n\n{position.symbol} {format_side(position.side)} x{position.leverage:g}\n"
+            f"Теперь без TP/SL.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("Назад", "nav:transactions:0", icon=PIN_ID)]]),
+        )
+        await callback.answer("TP/SL убраны")
+    except Exception as exc:
+        await session.rollback()
+        html_text = safe_trade_error(exc)
+        await callback.answer(_strip_tags(html_text)[:200], show_alert=True)
+        if callback.message:
+            await callback.message.edit_text(html_text, parse_mode=ParseMode.HTML)

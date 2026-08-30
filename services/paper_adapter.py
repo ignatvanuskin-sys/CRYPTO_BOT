@@ -523,3 +523,21 @@ async def close_position(
     await session.flush()
     increment("trade_closed")
     return position, net
+
+
+async def update_position_tp_sl(
+    session,
+    position: PaperPosition,
+    take_profit: Decimal | None,
+    stop_loss: Decimal | None,
+) -> PaperPosition:
+    """Обновить TP/SL у открытой позиции."""
+    if position.status != PositionStatus.OPEN.value:
+        raise PaperError("Position not open")
+    _validate_tp_sl(position.side, position.entry_price, take_profit, stop_loss)
+    position.take_profit = take_profit
+    position.stop_loss = stop_loss
+    position.updated_at = datetime.now(timezone.utc)
+    await session.flush()
+    increment("tp_sl_updated")
+    return position

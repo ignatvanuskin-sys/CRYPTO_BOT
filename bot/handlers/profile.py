@@ -307,7 +307,10 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         return
 
     kb_rows = [
-        [btn(f"Закрыть {p.symbol} {format_side(p.side)}", f"close_preview:{p.id}", icon=RED_ID, style="danger")]
+        [
+            btn(f"Закрыть {p.symbol} {format_side(p.side)}", f"close_preview:{p.id}", icon=RED_ID, style="danger"),
+            btn("TP/SL", f"edit_tp_sl:{p.id}", icon=STAR_ID, style="primary"),
+        ]
         for p in positions
     ]
     pag_row = []

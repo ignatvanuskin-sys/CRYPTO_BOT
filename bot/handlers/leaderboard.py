@@ -208,10 +208,10 @@ async def cmd_top(message: Message, session):
     # Pagination for initial view (page 0)
     kb_rows = []
     if total > 10:
-        kb_rows.append(btn("Ещё ▶", "nav:top:10", icon=PIN_ID))
-    kb_rows.append(btn("Обновить", "nav:top:0", icon=CHART_ID, style="success"))
-    kb_rows.append(btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success"))
-    kb_rows.append(btn("Назад", "nav:home", icon=PIN_ID))
+        kb_rows.append([btn("Ещё ▶", "nav:top:10", icon=PIN_ID)])
+    kb_rows.append([btn("Обновить", "nav:top:0", icon=CHART_ID, style="success")])
+    kb_rows.append([btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")])
+    kb_rows.append([btn("Назад", "nav:home", icon=PIN_ID)])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -295,10 +295,13 @@ async def _build_open_positions(telegram_id: int, session):
             f"Вход {fmt_price(p.entry_price)} → Сейчас {fmt_price(p.current_price)}\n"
             f"Объём {fmt_money(p.notional)}"
         )
-        kb_rows.append(btn(f"Закрыть {p.symbol}", f"close_preview:{p.id}", icon=RED_ID, style="danger"))
-    kb_rows.append(btn("Обновить", "nav:positions", icon=GREEN_ID, style="success"))
-    kb_rows.append(btn("Сделки (все)", "nav:history:0", icon=CHART_ID, style="primary"))
-    kb_rows.append(btn("Топ", "nav:top", icon=GOLD_ID, style="primary"))
+        kb_rows.append([
+            btn(f"Закрыть {p.symbol}", f"close_preview:{p.id}", icon=RED_ID, style="danger"),
+            btn("TP/SL", f"edit_tp_sl:{p.id}", icon=STAR_ID, style="primary"),
+        ])
+    kb_rows.append([btn("Обновить", "nav:positions", icon=GREEN_ID, style="success")])
+    kb_rows.append([btn("Сделки (все)", "nav:history:0", icon=CHART_ID, style="primary")])
+    kb_rows.append([btn("Топ", "nav:top", icon=GOLD_ID, style="primary")])
     return ("\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
@@ -367,9 +370,9 @@ async def nav_top(callback: CallbackQuery, session):
         pag.append(btn("Ещё ▶", f"nav:top:{offset+10}", icon=PIN_ID))
     if pag:
         kb_rows.append(pag)
-    kb_rows.append(btn("Обновить", f"nav:top:{offset}", icon=CHART_ID, style="success"))
-    kb_rows.append(btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success"))
-    kb_rows.append(btn("Назад", "nav:home", icon=PIN_ID))
+    kb_rows.append([btn("Обновить", f"nav:top:{offset}", icon=CHART_ID, style="success")])
+    kb_rows.append([btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")])
+    kb_rows.append([btn("Назад", "nav:home", icon=PIN_ID)])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     if callback.message:
         try:
