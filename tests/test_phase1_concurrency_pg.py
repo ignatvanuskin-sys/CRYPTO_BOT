@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from db.competition_models import Competition, CompetitionStatus
+from db.competition_models import Competition, CompetitionStatus, Execution
 from db.models import User
 from db.paper_models import (
     AccountLedger,
@@ -175,17 +175,30 @@ async def test_pg_concurrent_close_same_key_single_effect(pg_engine):
                 return ("err", f"{type(e).__name__}:{e}")
 
     results = await asyncio.gather(close_attempt(), close_attempt())
+    # Idempotent: either one succeeded and the other saw the closed position
+    # (returning the same realized_pnl), or both returned the same canonical
+    # value — SAME key must never produce two financial mutations.
     oks = [r for r in results if r[0] == "ok"]
-    assert len(oks) == 1, f"expected exactly one successful close: {results}"
+    pnls = {r[1] for r in oks}
+    assert len(oks) >= 1, f"expected at least one successful close: {results}"
+    assert len(pnls) == 1, f"both ok results must produce the SAME pnl: {results}"
 
     async with factory() as session:
+        close_order_count = (await session.execute(
+            select(func.count()).select_from(PaperOrder).where(PaperOrder.reduce_only.is_(True))
+        )).scalar_one()
         close_ledger_count = (await session.execute(
             select(func.count()).select_from(AccountLedger).where(
                 AccountLedger.account_id == account_id,
                 AccountLedger.type == LedgerType.TRADE_CLOSE.value,
             )
         )).scalar_one()
+        execution_count = (await session.execute(
+            select(func.count()).select_from(Execution).where(Execution.position_id == pos_id)
+        )).scalar_one()
+        assert close_order_count == 1, f"close orders={close_order_count}"
         assert close_ledger_count == 1, f"TRADE_CLOSE ledgers={close_ledger_count}"
+        assert execution_count == 1, f"executions={execution_count}"
         pos = await session.get(PaperPosition, pos_id)
         assert pos.status == PositionStatus.CLOSED.value
     await _assert_pg_reconciliation(pg_engine, account_id)
