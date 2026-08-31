@@ -162,7 +162,7 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
 @router.message(Command("leaders", ignore_case=True))
 @router.message(Command("лидеры", ignore_case=True))
 @router.message(Command("таблица_лидеров", ignore_case=True))
-@router.message(F.text.in_({"Топ", "Список лидеров", "Лидеры", "Таблица лидеров", "🏆 Список лидеров", "🏆 Топ", "Список лидеров", "🏆 Список лидеров", "Список лидеров"}))
+@router.message(F.text.in_({"Топ", "Топ 10", "Список лидеров", "Лидеры", "Таблица лидеров", "🏆 Список лидеров", "🏆 Топ", "🏆 Топ 10"}))
 async def cmd_top(message: Message, session):
     if message.from_user is None:
         return

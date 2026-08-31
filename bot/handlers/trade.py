@@ -354,7 +354,7 @@ async def handle_trade_text(message: Message, session):
     if message.from_user is None or message.text is None:
         raise SkipHandler
     # Не перехватываем команды и навигацию — даём другим хендлерам шанс
-    if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать", "Список лидеров", "Позиции", "Топ"):
+    if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать", "Список лидеров", "Топ 10", "Позиции", "Топ"):
         trade_state.pop(message.from_user.id, None)
         raise SkipHandler
     state = trade_state.get(message.from_user.id)
@@ -1385,11 +1385,10 @@ async def cb_edit_tp_sl(callback: CallbackQuery, session):
     }
     current_tp = fmt_price(position.take_profit) if position.take_profit else "нет"
     current_sl = fmt_price(position.stop_loss) if position.stop_loss else "нет"
-    # Build keyboard with separate delete TP/SL per user request
+    # Separate TP/SL for both set and delete per user request
     kb_rows: list[list[InlineKeyboardButton]] = [
-        [btn("Поставить TP и SL", f"edit_tp_sl:set:{pos_id}", icon=STAR_ID, style="primary")],
+        [btn("Поставить TP", f"edit_tp_sl:set:tp:{pos_id}", icon=STAR_ID, style="primary"), btn("Поставить SL", f"edit_tp_sl:set:sl:{pos_id}", icon=STAR_ID, style="primary")],
     ]
-    # Show delete buttons only if TP/SL exists, but keep always for simplicity
     del_row: list[InlineKeyboardButton] = []
     if position.take_profit is not None:
         del_row.append(btn("Удалить TP", f"edit_tp_sl:clear:tp:{pos_id}", icon=TRASH_ID, style="danger"))
@@ -1397,7 +1396,6 @@ async def cb_edit_tp_sl(callback: CallbackQuery, session):
         del_row.append(btn("Удалить SL", f"edit_tp_sl:clear:sl:{pos_id}", icon=TRASH_ID, style="danger"))
     if del_row:
         kb_rows.append(del_row)
-    # Fallback: if both none, keep single clear for both (legacy)
     if not del_row:
         kb_rows.append([btn("Убрать TP/SL", f"edit_tp_sl:clear:{pos_id}", icon=TRASH_ID, style="danger")])
     kb_rows.append([btn("Назад", f"nav:transactions:0", icon=PIN_ID)])
@@ -1587,8 +1585,18 @@ async def cb_edit_tp_sl_set(callback: CallbackQuery, session):
     if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
+    parts = callback.data.split(":")
+    # edit_tp_sl:set:tp:{id} / edit_tp_sl:set:sl:{id}
     try:
-        pos_id = int(callback.data.split(":")[2])
+        if len(parts) == 4 and parts[2] in ("tp", "sl"):
+            which = parts[2]
+            pos_id = int(parts[3])
+        elif len(parts) == 3:
+            # legacy set both -> default to TP choice menu
+            which = "both"
+            pos_id = int(parts[2])
+        else:
+            raise ValueError
     except ValueError:
         await callback.answer("Некорректные данные", show_alert=True)
         return
@@ -1599,24 +1607,54 @@ async def cb_edit_tp_sl_set(callback: CallbackQuery, session):
     if not await _competition_tradeable(session, position):
         await callback.answer("Турнир уже завершён", show_alert=True)
         return
+    if which == "both":
+        trade_state[callback.from_user.id] = {
+            "editing_position_id": pos_id,
+            "symbol": position.symbol,
+            "side": format_side(position.side),
+            "awaiting": "edit_tp_sl_choice",
+        }
+        await callback.message.edit_text(
+            f"⭐️ <b>УСТАНОВКА TP/SL</b>\n\n"
+            f"{position.symbol} {format_side(position.side)} {fmt_leverage(position.leverage)}\n\n"
+            f"Как задать уровни?\n"
+            f"🎯 В процентах от маржи (100% = прибыль равна марже)\n"
+            f"💵 Точной ценой\n\n"
+            f"LONG: TP > входа, SL < входа\n"
+            f"SHORT: TP < входа, SL > входа",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [btn("В процентах", f"edit_tp_sl:mode:percent:{pos_id}", icon=STAR_ID, style="primary"), btn("Точной ценой", f"edit_tp_sl:mode:price:{pos_id}", icon=MONEY_ID, style="primary")],
+                    [btn("Назад", f"edit_tp_sl:{pos_id}", icon=PIN_ID)],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+    # Separate TP or SL — show dedicated input prompt
+    is_tp = which == "tp"
     trade_state[callback.from_user.id] = {
         "editing_position_id": pos_id,
         "symbol": position.symbol,
         "side": format_side(position.side),
-        "awaiting": "edit_tp_sl_choice",
+        "awaiting": "edit_tp_only" if is_tp else "edit_sl_only",
+        "mode": "price",
     }
+    current_other = fmt_price(position.stop_loss) if is_tp and position.stop_loss else fmt_price(position.take_profit) if not is_tp and position.take_profit else "нет"
     await callback.message.edit_text(
-        f"⭐️ <b>УСТАНОВКА TP/SL</b>\n\n"
-        f"{position.symbol} {format_side(position.side)} {fmt_leverage(position.leverage)}\n\n"
-        f"Как задать уровни?\n"
-        f"🎯 В процентах от маржи (100% = прибыль равна марже)\n"
-        f"💵 Точной ценой\n\n"
-        f"LONG: TP > входа, SL < входа\n"
-        f"SHORT: TP < входа, SL > входа",
+        f"{'🎯' if is_tp else '🛡'} <b>УСТАНОВКА {'TP' if is_tp else 'SL'}</b>\n\n"
+        f"{position.symbol} {format_side(position.side)} {fmt_leverage(position.leverage)}\n"
+        f"Вход: {fmt_price(position.entry_price)} → Сейчас: {fmt_price(position.current_price)}\n"
+        f"Текущий {'TP' if is_tp else 'SL'}: {'нет' if (position.take_profit if is_tp else position.stop_loss) is None else fmt_price(position.take_profit if is_tp else position.stop_loss)}\n"
+        f"{'SL' if is_tp else 'TP'} (не меняется): {current_other}\n\n"
+        f"Введи {'цену TP' if is_tp else 'цену SL'} числом, например: {'105000' if position.symbol == 'BTCUSDT' else '180'}\n"
+        f"Или в процентах от маржи: {'5%' if is_tp else '-3%'} (100% = прибыль равна марже)\n\n"
+        f"LONG: {'TP выше' if is_tp else 'SL ниже'} входа, SHORT наоборот.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [btn("В процентах", f"edit_tp_sl:mode:percent:{pos_id}", icon=STAR_ID, style="primary"), btn("Точной ценой", f"edit_tp_sl:mode:price:{pos_id}", icon=MONEY_ID, style="primary")],
+                [btn("В процентах", f"edit_tp_sl:only:{'tp_percent' if is_tp else 'sl_percent'}:{pos_id}", icon=STAR_ID, style="primary")],
                 [btn("Назад", f"edit_tp_sl:{pos_id}", icon=PIN_ID)],
             ]
         ),
