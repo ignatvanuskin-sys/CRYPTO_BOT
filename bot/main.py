@@ -124,6 +124,7 @@ async def main() -> None:
                     BotCommand(command="history", description="Все сделки — статистика закрытых"),
                     BotCommand(command="profile", description="Личный кабинет — баланс, ROE, место"),
                     BotCommand(command="top", description="Список лидеров недели"),
+                    BotCommand(command="help", description="Как это работает"),
                     BotCommand(command="start", description="Запуск и верификация номера"),
                 ]
             )
