@@ -401,9 +401,9 @@ async def nav_top(callback: CallbackQuery, session):
     kb_rows = []
     if total > 5:
         if not is_all:
-            kb_rows.append([btn("Все места (20)", "nav:top:all", icon=CHART_ID, style="primary")])
+            kb_rows.append([btn("Все места", "nav:top:all", icon=CHART_ID, style="primary")])
         else:
-            kb_rows.append([btn("Топ 5", "nav:top:0", icon=PIN_ID)])
+            kb_rows.append([btn("Свернуть", "nav:top:0", icon=PIN_ID)])
     kb_rows.append([btn("Обновить", "nav:top:all" if is_all else f"nav:top:{offset}", icon=CHART_ID, style="success")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     if callback.message:
