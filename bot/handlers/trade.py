@@ -257,11 +257,6 @@ def _liquidation_lines(side: str, entry: Decimal | None, leverage: Decimal, quan
         lines += f"{TG_SIREN} Ликвидация (изолиров., legacy): {fmt_price(liq)} (движение {move_txt} против позиции)\n"
     elif move is not None:
         lines += f"{TG_SIREN} Ликвидация: движение {move_txt} против позиции\n"
-    if leverage >= HIGH_LEVERAGE_WARNING_AT and move is not None:
-        lines += (
-            f"{TG_WARNING} Плечо {fmt_leverage(leverage)}: цена может пройти {move_txt} "
-            "за секунды — позиция закроется, маржа сгорит полностью.\n"
-        )
     return lines
 
 
@@ -905,17 +900,10 @@ async def cb_leverage(callback: CallbackQuery):
         "awaiting": "side",
     }
     lev_value = Decimal(leverage)
-    warning = ""
-    if lev_value >= HIGH_LEVERAGE_WARNING_AT:
-        move_txt = fmt_leverage_move_pct(liquidation_move_pct(lev_value))
-        warning = (
-            f"\n{TG_WARNING} <b>Высокое плечо.</b> Движение цены на {move_txt} "
-            "против позиции закрывает её принудительно — маржа сгорает полностью.\n"
-        )
     await callback.message.edit_text(
         f"{TG_LONG} {TG_SHORT} <b>НАПРАВЛЕНИЕ</b>\n\n"
         f"{symbol} | Маржа: {fmt_money(Decimal(budget))} | {fmt_leverage(lev_value)}\n"
-        f"{warning}\nВыберите направление:",
+        f"Выберите направление:",
         parse_mode=ParseMode.HTML,
         reply_markup=side_keyboard(symbol, budget, leverage),
     )
