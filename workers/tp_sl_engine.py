@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -16,8 +15,9 @@ from services.bingx_market_data import (
     get_execution_snapshot,
 )
 from services.metrics import increment
+from services.notifications import notify_positions_closed
 from services.paper_adapter import close_position
-from services.pnl import calc_unrealized
+from services.pnl import calc_unrealized, liquidation_threshold_pnl
 from services.trading_account import refresh_account_stats
 
 logger = logging.getLogger(__name__)
@@ -25,12 +25,18 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 500
 
 
-async def check_and_close_positions(engine: AsyncEngine) -> int:
+async def check_and_close_positions(
+    engine: AsyncEngine, events: list[dict] | None = None
+) -> int:
     """Mark open positions and close triggered TP/SL positions once.
 
     Paginates through ALL open positions (PAGE_SIZE per page, keyed by id)
     so no position is starved from price-marking / liquidation / TP-SL
     checks at scale. Each page is its own session + commit.
+
+    If ``events`` is given, it is filled with one dict per automatically
+    closed position (only after that page's commit succeeded) so the caller
+    can push notifications. Notification work never touches financial state.
     """
     factory = async_sessionmaker(engine, expire_on_commit=False)
     closed_count = 0
@@ -50,12 +56,16 @@ async def check_and_close_positions(engine: AsyncEngine) -> int:
             if not positions:
                 break
             last_id = positions[-1].id
-            closed_count += await _process_page(session, positions)
+            page_events: list[dict] = []
+            closed_count += await _process_page(session, positions, page_events)
             await session.commit()
+            # Only announce closes that actually made it to disk.
+            if events is not None:
+                events.extend(page_events)
     return closed_count
 
 
-async def _process_page(session, positions) -> int:
+async def _process_page(session, positions, events: list[dict] | None = None) -> int:
     closed_count = 0
     for position in positions:
         try:
@@ -83,9 +93,11 @@ async def _process_page(session, positions) -> int:
             continue
         await refresh_account_stats(session, account)
 
-        # Liquidation check — 90% of margin lost (protects from negative return_amount)
-        margin = (position.notional / Decimal(str(position.leverage or 1))).quantize(Decimal("0.01"))
-        if position.unrealized_pnl <= -margin * Decimal("0.9"):
+        # Liquidation check — 90% of margin lost (protects from negative return_amount).
+        # Threshold lives in services.pnl so the UI shows the very same price.
+        if position.unrealized_pnl <= liquidation_threshold_pnl(
+            position.notional, position.leverage
+        ):
             reason = "LIQUIDATION"
         else:
             reason = None
@@ -112,6 +124,18 @@ async def _process_page(session, positions) -> int:
                     reason=reason,
                 )
             closed_count += 1
+            if events is not None:
+                events.append(
+                    {
+                        "position_id": position.id,
+                        "user_id": account.user_id,
+                        "symbol": position.symbol,
+                        "side": position.side,
+                        "leverage": position.leverage,
+                        "pnl": position.realized_pnl,
+                        "reason": reason,
+                    }
+                )
             if reason == "LIQUIDATION":
                 increment("liquidation_triggered")
             elif reason == "TP":
@@ -137,12 +161,20 @@ async def run_forever(engine: AsyncEngine | None = None) -> None:
         engine = create_async_engine(settings.database_url_async, echo=False)
     try:
         while True:
+            events: list[dict] = []
             try:
-                await check_and_close_positions(engine)
+                await check_and_close_positions(engine, events)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("TP/SL loop error")
+            if events:
+                try:
+                    await notify_positions_closed(engine, events)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Close notifications failed")
             await asyncio.sleep(1)
     finally:
         if owns_engine:
