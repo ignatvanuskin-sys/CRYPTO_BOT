@@ -109,7 +109,7 @@ db/
   competition_models.py # Competition, Participant, Execution, Snapshot, Prize
   market_data.py        # MarketSnapshot
 alembic/versions/       # 001…009
-tests/                  # 68 тестов (61 passed / 7 skipped локально)
+tests/                  # 245 тестов (все passed)
 docs/ANTI_CHEAT_AUDIT.md, AUDIT_DEEP_REPORT.md, AUDIT_REPORT_V2.md
 Procfile, nixpacks.toml, runtime.txt, pytest.ini
 ```
@@ -462,8 +462,8 @@ Helper: `btn(text, callback_data, icon=…, style=…)` в `bot/views.py`.
 
 ## 15. ТЕСТЫ
 
-**Локально:** `61 passed, 7 skipped` (7 = PG-тесты: 4 legacy race + 3 Phase 1 concurrency).
-**На реальном PG** (`railway ssh` → `test_railway`, изолированная БД): **21+4 passed**.
+**Локально:** `245 passed, 0 failed` (включая PG через testcontainers/Docker).
+**На реальном PG** (`railway ssh` → `test_railway`, изолированная БД): **7 passed** (4 paper_race + 3 Phase 1 concurrency).
 
 | Файл | Покрывает |
 |---|---|
@@ -536,7 +536,7 @@ pip install -r requirements.txt
 cp .env.example .env          # заполнить BOT_TOKEN, DATABASE_URL
 alembic upgrade head
 python -m bot.main
-pytest -q                     # 43 passed, 7 skipped
+pytest -q                     # 245 passed
 
 # Railway
 railway up --detach -m "…"

@@ -67,7 +67,7 @@ FROM market_snapshots WHERE symbol IN ('BTCUSDT','ETHUSDT','SOLUSDT') ORDER BY s
 
 ```
 pytest -q
-22 passed, 4 skipped (PG-гонки требуют Docker/TEST_DATABASE_URL, пассуют в CI)
+102 passed, 7 skipped, 0 failed (109 collected; 7 PG — все прошли на Railway test_railway)
 ```
 
 Покрыто: ASK/BID-правила, Decimal-деньги, идемпотентность, плечо (`margin = notional/leverage`),
