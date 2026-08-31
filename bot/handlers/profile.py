@@ -258,7 +258,7 @@ async def _send_profile(telegram_id: int, session, target: Message | CallbackQue
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [btn("Сделки", "nav:transactions", icon=GREEN_ID, style="primary")],
-                [btn("Топ 10", "nav:top", icon=GOLD_ID, style="primary")],
+                [btn("Список лидеров", "nav:top", icon=GOLD_ID, style="primary")],
                 [btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")],
             ]
         ),
@@ -479,7 +479,7 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
         kb_rows.append(pag_row)
     kb_rows.append([btn("Обновить", f"nav:history:{offset}", icon=GREEN_ID, style="success")])
     kb_rows.append([btn("Активные сделки", "nav:transactions:0", icon=CHART_ID, style="primary")])
-    kb_rows.append([btn("Топ 10", "nav:top", icon=GOLD_ID, style="primary")])
+    kb_rows.append([btn("Список лидеров", "nav:top", icon=GOLD_ID, style="primary")])
 
     page_num = offset // limit + 1
     total_pages = (total_closed + limit - 1) // limit

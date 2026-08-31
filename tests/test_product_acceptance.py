@@ -15,8 +15,9 @@ def test_main_menu_has_reference_navigation():
     labels = [button.text for row in kb.keyboard for button in row]
     assert "Торговать" in labels
     assert "Личный кабинет" in labels
-    assert "Топ 10" in labels
+    assert "Список лидеров" in labels
     assert "Сделки" in labels
+    assert "Список лидеров" in labels
     # premium icons via icon_custom_emoji_id, not regular emojis in text
     icons = [button.icon_custom_emoji_id for row in kb.keyboard for button in row]
     assert CHART_UP_ID in icons

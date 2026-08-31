@@ -88,7 +88,7 @@ async def test_leaderboard_beautiful_table_has_medals_and_roi(session):
     # Format beautiful table
     from bot.handlers.leaderboard import _format_leaderboard_text
     users_map = {u.id: u for u in users}
-    text = _format_leaderboard_text("Weekly Trading Cup #1", top10, users_map, is_final=False)
+    text = _format_leaderboard_text("Weekly Trading Cup #1", top10, users_map, is_final=False, limit=10)
     # Must contain header, medals, ROI, equity
     assert "TOP" in text.upper() or "ЛИДЕР" in text.upper() or "CUP" in text.upper()
     assert "$" in text

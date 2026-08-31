@@ -63,17 +63,17 @@ def _medal(rank: int) -> str:
     return f"{rank}."
 
 
-def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dict[int, User], is_final: bool, offset: int = 0) -> str:
-    """Красивая таблица топ-10 с пагинацией."""
+def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dict[int, User], is_final: bool, offset: int = 0, limit: int = 5) -> str:
+    """Список лидеров — 5 по умолчанию, 20 по кнопке Все места."""
     total = len(leaderboard)
-    # For display, slice by offset
-    page = leaderboard[offset:offset+10]
+    page = leaderboard[offset:offset+limit]
     header = f"{TG_CROWN} <b>{title}</b>\n"
     if is_final:
-        header += f"{TG_STAR} <i>Итоги недели — финальный топ-{10 if total>=10 else total}</i>\n"
+        header += f"{TG_STAR} <i>Итоги недели — финальный топ-{limit if total>=limit else total}</i>\n"
     else:
         header += f"{TG_CHART} <i>Live топ — обновляется каждую сделку</i>\n"
-    header += f"Страница {offset//10+1}/{(total+9)//10} — всего {total}\n"
+    if total > limit:
+        header += f"Показано {len(page)} из {total}\n"
     header += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     if not page:
@@ -108,7 +108,7 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
     if comp is not None:
         lb = await build_leaderboard(session, comp.id)
         total = len(lb)
-        user_ids = [e["user_id"] for e in lb[offset:offset+10]]
+        user_ids = [e["user_id"] for e in lb[offset:offset+5]]
         users_map = {}
         if user_ids:
             res = await session.execute(select(User).where(User.id.in_(user_ids)))
@@ -134,7 +134,7 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
             lb = []
             for s in snaps:
                 lb.append({"rank": s.rank, "user_id": s.user_id, "roi": s.roi, "equity": s.equity})
-            user_ids = [e["user_id"] for e in lb[offset:offset+10]]
+            user_ids = [e["user_id"] for e in lb[offset:offset+5]]
             users_map = {}
             if user_ids:
                 res2 = await session.execute(select(User).where(User.id.in_(user_ids)))
@@ -144,7 +144,7 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
             return title, lb, users_map, True, comp, total
         lb = await build_leaderboard(session, comp.id)
         total = len(lb)
-        user_ids = [e["user_id"] for e in lb[offset:offset+10]]
+        user_ids = [e["user_id"] for e in lb[offset:offset+5]]
         users_map = {}
         if user_ids:
             res = await session.execute(select(User).where(User.id.in_(user_ids)))
@@ -162,7 +162,7 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
 @router.message(Command("leaders", ignore_case=True))
 @router.message(Command("лидеры", ignore_case=True))
 @router.message(Command("таблица_лидеров", ignore_case=True))
-@router.message(F.text.in_({"Топ", "Топ 10", "Лидеры", "Таблица лидеров", "🏆 Топ 10", "🏆 Топ"}))
+@router.message(F.text.in_({"Топ", "Список лидеров", "Лидеры", "Таблица лидеров", "🏆 Список лидеров", "🏆 Топ", "Список лидеров", "🏆 Список лидеров", "Список лидеров"}))
 async def cmd_top(message: Message, session):
     if message.from_user is None:
         return
@@ -177,7 +177,7 @@ async def cmd_top(message: Message, session):
 
     if comp is None:
         await message.answer(
-            f"{TG_CHART} <b>Топ пока пуст</b>\n\nТурнир ещё не начался. Откройте сделку — попадёте в таблицу!",
+            f"{TG_CHART} <b>Список лидеров пуст</b>\n\nТурнир ещё не начался. Откройте сделку — попадёте в таблицу!",
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu(),
         )
@@ -213,13 +213,10 @@ async def cmd_top(message: Message, session):
             time_left = f"{hours}ч {mins}м"
         text += f"\n{tg_emoji(CALENDAR_ID, '🗓')} До итогов: {time_left}"
 
-    # Pagination for initial view (page 0)
     kb_rows = []
-    if total > 10:
-        kb_rows.append([btn("Ещё ▶", "nav:top:10", icon=PIN_ID)])
+    if total > 5:
+        kb_rows.append([btn("Все места (20)", "nav:top:all", icon=CHART_ID, style="primary")])
     kb_rows.append([btn("Обновить", "nav:top:0", icon=CHART_ID, style="success")])
-    kb_rows.append([btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")])
-    kb_rows.append([btn("Назад", "nav:home", icon=PIN_ID)])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -324,7 +321,7 @@ async def _build_open_positions(telegram_id: int, session):
         ])
     kb_rows.append([btn("Обновить", "nav:positions", icon=GREEN_ID, style="success")])
     kb_rows.append([btn("Сделки (все)", "nav:history:0", icon=CHART_ID, style="primary")])
-    kb_rows.append([btn("Топ", "nav:top", icon=GOLD_ID, style="primary")])
+    kb_rows.append([btn("Список лидеров", "nav:top", icon=GOLD_ID, style="primary")])
     return ("\n\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
@@ -339,25 +336,42 @@ async def nav_top(callback: CallbackQuery, session):
         trade_state.pop(callback.from_user.id, None)
     except Exception:
         pass
-    # Parse offset
+    # Parse offset — support 5 and all(20), no arrows
+    is_all = False
     offset = 0
+    limit = 5
     parts = callback.data.split(":")
     if len(parts) == 3:
-        try:
-            offset = int(parts[2])
-        except ValueError:
+        if parts[2] == "all":
+            is_all = True
+            limit = 20
             offset = 0
+        else:
+            try:
+                offset = int(parts[2])
+            except ValueError:
+                offset = 0
+            # if offset==0 and total will be >5, default limit 5
+            limit = 20 if is_all else 5
     title, lb, users_map, is_final, comp, total = await _get_leaderboard_for_display(session, offset=offset)
+    # for all, refetch users_map for 20
+    if is_all and comp is not None:
+        from sqlalchemy import select as _select
+        from db.models import User as _User
+        uids = [e["user_id"] for e in lb[0:20]]
+        if uids:
+            res = await session.execute(_select(_User).where(_User.id.in_(uids)))
+            users_map = {u.id: u for u in res.scalars().all()}
     if comp is None:
         if callback.message:
             await callback.message.answer(
-                f"{TG_CHART} <b>Топ пока пуст</b>",
+                f"{TG_CHART} <b>Список лидеров пуст</b>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_menu(),
             )
         await callback.answer()
         return
-    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=offset)
+    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=offset, limit=limit)
     # Add user rank footer — lb is the FULL list, no second build needed
     user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if user and comp:
@@ -384,18 +398,13 @@ async def nav_top(callback: CallbackQuery, session):
         time_left = f"{days}д {hours}ч" if days > 0 else f"{hours}ч {mins}м"
         text += f"\n{tg_emoji(CALENDAR_ID, '🗓')} До итогов: {time_left}"
 
-    # Pagination keyboard
     kb_rows = []
-    pag = []
-    if offset > 0:
-        pag.append(btn("◀ Назад", f"nav:top:{max(0, offset-10)}", icon=PIN_ID))
-    if offset + 10 < total:
-        pag.append(btn("Ещё ▶", f"nav:top:{offset+10}", icon=PIN_ID))
-    if pag:
-        kb_rows.append(pag)
-    kb_rows.append([btn("Обновить", f"nav:top:{offset}", icon=CHART_ID, style="success")])
-    kb_rows.append([btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")])
-    kb_rows.append([btn("Назад", "nav:home", icon=PIN_ID)])
+    if total > 5:
+        if not is_all:
+            kb_rows.append([btn("Все места (20)", "nav:top:all", icon=CHART_ID, style="primary")])
+        else:
+            kb_rows.append([btn("Топ 5", "nav:top:0", icon=PIN_ID)])
+    kb_rows.append([btn("Обновить", "nav:top:all" if is_all else f"nav:top:{offset}", icon=CHART_ID, style="success")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     if callback.message:
         try:

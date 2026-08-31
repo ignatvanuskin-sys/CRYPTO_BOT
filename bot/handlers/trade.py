@@ -354,7 +354,7 @@ async def handle_trade_text(message: Message, session):
     if message.from_user is None or message.text is None:
         raise SkipHandler
     # Не перехватываем команды и навигацию — даём другим хендлерам шанс
-    if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать", "Топ 10", "Позиции", "Топ"):
+    if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать", "Список лидеров", "Позиции", "Топ"):
         trade_state.pop(message.from_user.id, None)
         raise SkipHandler
     state = trade_state.get(message.from_user.id)
