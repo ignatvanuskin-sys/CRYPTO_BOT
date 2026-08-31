@@ -6,7 +6,8 @@ class TestMainMenu:
     def test_buttons(self):
         kb = main_menu()
         labels = [b.text for row in kb.keyboard for b in row]
-        assert labels == ["Торговать", "Личный кабинет", "Топ 10", "Сделки"]
+        # Spec 4 primary + secondary per new UX
+        assert labels == ["Торговать", "Мои позиции", "Лидерборд", "Профиль", "История", "Соревнование", "Помощь"]
 
     def test_premium_icons(self):
         kb = main_menu()
