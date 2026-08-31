@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -26,6 +26,7 @@ from bot.emojis import (
     LONG_EMOJI_ID,
     MONEY_ID,
     PIN_ID,
+    PLAY_ID,
     RED_ID,
     SHORT_EMOJI_ID,
     SIREN_ID,
@@ -36,7 +37,18 @@ from bot.emojis import (
     TG_LONG,
     TG_SHORT,
 )
-from bot.views import back_keyboard, bingx_chart_url, btn, fmt_money, fmt_price, format_side, get_display_snapshot
+from bot.views import (
+    back_keyboard,
+    bingx_chart_url,
+    btn,
+    fmt_leverage,
+    fmt_leverage_move_pct,
+    fmt_money,
+    fmt_price,
+    format_side,
+    get_display_snapshot,
+    safe_edit,
+)
 from config import settings
 from db.competition_models import Competition, CompetitionStatus
 from db.models import User
@@ -44,12 +56,19 @@ from db.paper_models import Instrument, PaperPosition, PositionStatus, TradingAc
 from services.accounts import ensure_can_trade
 from services.competition import get_or_create_default_competition, join_competition, update_participant_equity
 from services.paper_adapter import close_position, open_position
+from services.pnl import calc_liquidation_price, liquidation_move_pct
 from services.trading_account import get_or_create_trading_account
 
 router = Router()
 trade_state: dict[int, dict] = {}
 
 LEVERAGES = ["1", "2", "5", "10", "20", "50", "100", "150", "300"]
+
+# С этого плеча показываем предупреждение о риске ликвидации
+HIGH_LEVERAGE_WARNING_AT = Decimal("50")
+
+# Быстрые кнопки бюджета — чтобы не набирать сумму руками
+BUDGET_PRESETS = [Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")]
 
 TG_WARNING = tg_emoji(WARNING_ID, "⚠️")
 TG_CHECK = tg_emoji(CHECK_ID, "✔️")
@@ -189,13 +208,81 @@ async def _validate_instrument(session, symbol: str) -> Instrument | None:
     return inst
 
 
-async def _account_line(session, user: User) -> str:
-    account = (
+async def _get_account(session, user: User) -> TradingAccount | None:
+    return (
         await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
     ).scalar_one_or_none()
+
+
+async def _account_line(session, user: User) -> str:
+    account = await _get_account(session, user)
     if account is None:
         return "Баланс: —"
     return f"Доступно: {fmt_money(account.available_margin)}"
+
+
+def _available_margin(account: TradingAccount | None) -> Decimal | None:
+    if account is None or account.available_margin is None:
+        return None
+    value = Decimal(str(account.available_margin))
+    if not value.is_finite() or value <= 0:
+        return None
+    return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def budget_keyboard(symbol: str, available: Decimal | None) -> InlineKeyboardMarkup:
+    """Быстрые суммы маржи. Ввод текстом при этом продолжает работать."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for preset in BUDGET_PRESETS:
+        if available is not None and preset > available:
+            continue
+        row.append(btn(f"${preset:f}", f"bud:{symbol}:{preset:f}", icon=MONEY_ID, style="primary"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if available is not None:
+        rows.append([btn(f"Максимум — {fmt_money(available)}", f"bud:{symbol}:max", icon=DIAMOND_ID, style="success")])
+    rows.append([btn("Назад", "nav:trade", icon=PIN_ID)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _liquidation_lines(side: str, entry: Decimal | None, leverage: Decimal, quantity=None, notional=None) -> str:
+    """Строка с ценой ликвидации + предупреждение о высоком плече (A.1 / A.5)."""
+    move = liquidation_move_pct(leverage)
+    move_txt = fmt_leverage_move_pct(move)
+    lines = ""
+    liq = calc_liquidation_price(side, entry, leverage, quantity, notional) if entry else None
+    if liq is not None:
+        lines += f"{TG_SIREN} Ликвидация: {fmt_price(liq)} (движение {move_txt} против позиции)\n"
+    elif move is not None:
+        lines += f"{TG_SIREN} Ликвидация: движение {move_txt} против позиции\n"
+    if leverage >= HIGH_LEVERAGE_WARNING_AT and move is not None:
+        lines += (
+            f"{TG_WARNING} Плечо {fmt_leverage(leverage)}: цена может пройти {move_txt} "
+            "за секунды — позиция закроется, маржа сгорит полностью.\n"
+        )
+    return lines
+
+
+async def _show_leverage_step(target, session, user_id: int, symbol: str, budget: Decimal, *, edit: bool) -> None:
+    trade_state[user_id] = {
+        "symbol": symbol,
+        "budget": format(budget, "f"),
+        "awaiting": "leverage",
+    }
+    max_lev = None
+    inst = await session.get(Instrument, symbol)
+    if inst and inst.max_leverage:
+        max_lev = inst.max_leverage
+    text = f"{TG_GEAR} <b>ПЛЕЧО</b>\n\n{symbol} | Маржа: {fmt_money(budget)}\n\nВыберите плечо:"
+    markup = leverage_keyboard(symbol, format(budget, "f"), max_lev)
+    if edit:
+        await safe_edit(target, text, markup, ParseMode.HTML)
+    else:
+        await target.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 @router.message(Command("trade", ignore_case=True))
@@ -301,13 +388,14 @@ async def handle_trade_text(message: Message, session):
         if user is None:
             await message.answer("Сначала отправьте /start")
             return
-        account_line = await _account_line(session, user)
+        account = await _get_account(session, user)
+        available = _available_margin(account)
+        account_line = f"Доступно: {fmt_money(account.available_margin)}" if account else "Баланс: —"
         await message.answer(
             f"{TG_MONEY} <b>БЮДЖЕТ СДЕЛКИ</b>\n\n{symbol}\n{account_line}\n\n"
-            "Введите сумму, которую готовы зарезервировать под сделку (маржу), в USD.\n"
-            "Например: 100",
+            "Выберите сумму кнопкой или введите свою в USD — это маржа, которую вы резервируете под сделку.",
             parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard("nav:trade"),
+            reply_markup=budget_keyboard(symbol, available),
         )
         return
 
@@ -598,7 +686,7 @@ async def handle_trade_text(message: Message, session):
             await update_position_tp_sl(session, pos, account, tp, sl)
             await session.commit()
             await message.answer(
-                f"{TG_CHECK} <b>TP/SL ОБНОВЛЕНЫ</b>\n\n{pos.symbol} {format_side(pos.side)} x{pos.leverage:g}\n"
+                f"{TG_CHECK} <b>TP/SL ОБНОВЛЕНЫ</b>\n\n{pos.symbol} {format_side(pos.side)} {fmt_leverage(pos.leverage)}\n"
                 f"TP: {fmt_price(tp) if tp else 'нет'} → SL: {fmt_price(sl) if sl else 'нет'}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("Назад", "nav:transactions:0", icon=PIN_ID)]]),
@@ -610,7 +698,7 @@ async def handle_trade_text(message: Message, session):
         return
 
 
-async def _show_confirmation(message: Message, state: dict, session):
+async def _show_confirmation(message: Message, state: dict, session, edit: bool = False):
     symbol = state["symbol"]
     budget = Decimal(state["budget"])
     leverage = Decimal(state["leverage"])
@@ -627,19 +715,22 @@ async def _show_confirmation(message: Message, state: dict, session):
     state_line = (
         f"Цена входа ({side_word}): {fmt_price(entry)}\n" if entry else f"{TG_WARNING} Цена временно недоступна — исполнение по серверной цене BingX.\n"
     )
-    await message.answer(
+    text = (
         f"{TG_SIREN} <b>ПОДТВЕРЖДЕНИЕ СДЕЛКИ</b>\n\n"
         f"Пара: {symbol}\n"
         f"Направление: {side_tag} {side}\n"
         f"Маржа (бюджет): {fmt_money(budget)}\n"
-        f"Плечо: {leverage:g}x | Объём: {fmt_money(notional)}\n\n"
+        f"Плечо: {fmt_leverage(leverage)} | Объём: {fmt_money(notional)}\n\n"
         f"{state_line}"
         f"{TG_STAR} TP: {fmt_price(tp) if tp else 'нет'}\n"
-        f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(sl) if sl else 'нет'}\n\n"
-        "Исполнение — по серверной цене BingX в момент подтверждения.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=confirm_keyboard(),
+        f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(sl) if sl else 'нет'}\n"
+        f"{_liquidation_lines(side, entry, leverage)}\n"
+        "Исполнение — по серверной цене BingX в момент подтверждения."
     )
+    if edit:
+        await safe_edit(message, text, confirm_keyboard(), ParseMode.HTML)
+        return
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=confirm_keyboard())
 
 
 @router.callback_query(F.data.startswith("qsym:"))
@@ -657,13 +748,52 @@ async def cb_quick_symbol(callback: CallbackQuery, session):
     if user is None:
         await callback.answer("Сначала отправьте /start", show_alert=True)
         return
-    account_line = await _account_line(session, user)
+    account = await _get_account(session, user)
+    available = _available_margin(account)
+    account_line = f"Доступно: {fmt_money(account.available_margin)}" if account else "Баланс: —"
     await callback.message.edit_text(
         f"{TG_MONEY} <b>БЫСТРОЕ ОТКРЫТИЕ</b>\n\n{symbol}\n{account_line}\n\n"
-        "Введите сумму маржи в USD. Например: 100",
+        "Выберите сумму маржи кнопкой или введите свою в USD.",
         parse_mode=ParseMode.HTML,
-        reply_markup=back_keyboard("nav:trade"),
+        reply_markup=budget_keyboard(symbol, available),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bud:"))
+async def cb_budget_preset(callback: CallbackQuery, session):
+    """A.4: быстрые суммы маржи вместо ручного ввода."""
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    _, symbol, raw = parts
+    if await _validate_instrument(session, symbol) is None:
+        await callback.answer("Пара недоступна", show_alert=True)
+        return
+    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
+    if user is None:
+        await callback.answer("Сначала отправьте /start", show_alert=True)
+        return
+    available = _available_margin(await _get_account(session, user))
+    if raw == "max":
+        if available is None:
+            await callback.answer("Свободной маржи нет", show_alert=True)
+            return
+        budget = available
+    else:
+        # Принимаем только суммы из нашего набора — callback_data приходит от клиента
+        budget = next((preset for preset in BUDGET_PRESETS if f"{preset:f}" == raw), None)
+        if budget is None:
+            await callback.answer("Некорректная сумма", show_alert=True)
+            return
+        if available is not None and budget > available:
+            await callback.answer("Недостаточно доступной маржи", show_alert=True)
+            return
+    await _show_leverage_step(callback.message, session, callback.from_user.id, symbol, budget, edit=True)
     await callback.answer()
 
 
@@ -713,8 +843,18 @@ async def cb_leverage(callback: CallbackQuery):
         "leverage": leverage,
         "awaiting": "side",
     }
+    lev_value = Decimal(leverage)
+    warning = ""
+    if lev_value >= HIGH_LEVERAGE_WARNING_AT:
+        move_txt = fmt_leverage_move_pct(liquidation_move_pct(lev_value))
+        warning = (
+            f"\n{TG_WARNING} <b>Высокое плечо.</b> Движение цены на {move_txt} "
+            "против позиции закрывает её принудительно — маржа сгорает полностью.\n"
+        )
     await callback.message.edit_text(
-        f"{TG_LONG} {TG_SHORT} <b>НАПРАВЛЕНИЕ</b>\n\n{symbol} | Маржа: {fmt_money(Decimal(budget))} | {leverage}x\n\nВыберите направление:",
+        f"{TG_LONG} {TG_SHORT} <b>НАПРАВЛЕНИЕ</b>\n\n"
+        f"{symbol} | Маржа: {fmt_money(Decimal(budget))} | {fmt_leverage(lev_value)}\n"
+        f"{warning}\nВыберите направление:",
         parse_mode=ParseMode.HTML,
         reply_markup=side_keyboard(symbol, budget, leverage),
     )
@@ -934,13 +1074,21 @@ async def cb_confirm(callback: CallbackQuery, session):
         await session.commit()
         trade_state.pop(callback.from_user.id, None)
         side_tag = TG_LONG if position.side == "LONG" else TG_SHORT
+        liq_line = _liquidation_lines(
+            format_side(position.side),
+            position.entry_price,
+            Decimal(str(position.leverage or 1)),
+            position.quantity,
+            position.notional,
+        )
         await callback.message.edit_text(
             f"{TG_CHECK} <b>ПОЗИЦИЯ ОТКРЫТА</b>\n\n"
-            f"{position.symbol} {side_tag} {format_side(position.side)} x{position.leverage:g}\n"
+            f"{position.symbol} {side_tag} {format_side(position.side)} {fmt_leverage(position.leverage)}\n"
             f"Вход: {fmt_price(position.entry_price)}\n"
             f"Маржа: {fmt_money(Decimal(state['budget']))} | Объём: {fmt_money(position.notional)}\n"
             f"{TG_STAR} TP: {fmt_price(position.take_profit) if position.take_profit else 'нет'}\n"
-            f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(position.stop_loss) if position.stop_loss else 'нет'}\n\n"
+            f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(position.stop_loss) if position.stop_loss else 'нет'}\n"
+            f"{liq_line}\n"
             f"PnL обновляется в {TG_CHART} Мои сделки по живым ценам BingX.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
@@ -1006,7 +1154,7 @@ async def cb_close_preview(callback: CallbackQuery, session):
     side_tag = TG_LONG if position.side == "LONG" else TG_SHORT
     await callback.message.edit_text(
         f"{TG_SIREN} <b>ЗАКРЫТИЕ ПОЗИЦИИ</b>\n\n"
-        f"{position.symbol} {side_tag} {format_side(position.side)} x{position.leverage:g}\n"
+        f"{position.symbol} {side_tag} {format_side(position.side)} {fmt_leverage(position.leverage)}\n"
         f"Вход: {fmt_price(position.entry_price)}\n"
         f"Текущая цена: {fmt_price(current) if current else f'{TG_WARNING} рынок недоступен'}\n"
         f"Ожидаемый PnL: {fmt_money(pnl) if pnl is not None else '—'}\n\n"
@@ -1054,12 +1202,15 @@ async def cb_close_confirm(callback: CallbackQuery, session):
         side_tag = TG_LONG if closed.side == "LONG" else TG_SHORT
         await callback.message.edit_text(
             f"{TG_CHECK} <b>ПОЗИЦИЯ ЗАКРЫТА</b>\n\n"
-            f"{closed.symbol} {side_tag} {format_side(closed.side)}\n"
+            f"{closed.symbol} {side_tag} {format_side(closed.side)} {fmt_leverage(closed.leverage)}\n"
             f"Выход: {fmt_price(closed.current_price)}\n"
             f"Реализованный PnL: {fmt_money(pnl)}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[btn("Мои сделки", "nav:transactions", icon=CHART_ID, style="primary")]]
+                inline_keyboard=[
+                    [btn("Повторить сделку", f"retry:{closed.id}", icon=PLAY_ID, style="success")],
+                    [btn("Мои сделки", "nav:transactions", icon=CHART_ID, style="primary")],
+                ]
             ),
         )
         await callback.answer("Позиция закрыта")
@@ -1070,6 +1221,46 @@ async def cb_close_confirm(callback: CallbackQuery, session):
         await callback.answer(plain[:200], show_alert=True)
         if callback.message:
             await callback.message.edit_text(html_text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard("nav:transactions"))
+
+
+@router.callback_query(F.data.regexp(r"^retry:\d+$"))
+async def cb_retry_trade(callback: CallbackQuery, session):
+    """A.6: повторить закрытую сделку теми же параметрами — сразу к подтверждению."""
+    if callback.from_user is None or callback.message is None:
+        await callback.answer()
+        return
+    try:
+        pos_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Сделка не найдена", show_alert=True)
+        return
+    position = await _get_owned_position(session, callback.from_user.id, pos_id)
+    if position is None:
+        await callback.answer("Сделка не найдена", show_alert=True)
+        return
+    if await _validate_instrument(session, position.symbol) is None:
+        await callback.answer("Пара сейчас недоступна", show_alert=True)
+        return
+    leverage = Decimal(str(position.leverage or 1))
+    if leverage <= 0:
+        await callback.answer("Некорректное плечо", show_alert=True)
+        return
+    budget = (Decimal(str(position.notional)) / leverage).quantize(Decimal("0.01"))
+    if budget <= 0:
+        await callback.answer("Некорректная сумма", show_alert=True)
+        return
+    # TP/SL не переносим: сохранённые абсолютные цены уже неактуальны
+    state = {
+        "symbol": position.symbol,
+        "budget": format(budget, "f"),
+        "leverage": format(leverage, "f"),
+        "side": format_side(position.side),
+        "tp": None,
+        "sl": None,
+    }
+    trade_state[callback.from_user.id] = state
+    await _show_confirmation(callback.message, state, session, edit=True)
+    await callback.answer()
 
 
 @router.callback_query(F.data.regexp(r"^edit_tp_sl:\d+$"))
@@ -1100,7 +1291,7 @@ async def cb_edit_tp_sl(callback: CallbackQuery, session):
     current_sl = fmt_price(position.stop_loss) if position.stop_loss else "нет"
     await callback.message.edit_text(
         f"{TG_STAR} <b>РЕДАКТОР TP/SL</b>\n\n"
-        f"{position.symbol} {TG_LONG if format_side(position.side) == 'LONG' else TG_SHORT} {format_side(position.side)} x{position.leverage:g}\n"
+        f"{position.symbol} {TG_LONG if format_side(position.side) == 'LONG' else TG_SHORT} {format_side(position.side)} {fmt_leverage(position.leverage)}\n"
         f"Вход: {fmt_price(position.entry_price)} → Сейчас: {fmt_price(position.current_price)}\n"
         f"Текущий TP: {current_tp}\n"
         f"Текущий SL: {current_sl}\n\n"
@@ -1118,8 +1309,8 @@ async def cb_edit_tp_sl(callback: CallbackQuery, session):
     await callback.answer()
 
 
-async def _get_owned_open_position(session, telegram_id: int, pos_id: int) -> PaperPosition | None:
-    """FIX #4 IDOR: вернуть позицию только если она принадлежит аккаунту текущего юзера и открыта."""
+async def _get_owned_position(session, telegram_id: int, pos_id: int) -> PaperPosition | None:
+    """FIX #4 IDOR: позиция возвращается только если принадлежит аккаунту этого юзера."""
     user = (await session.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
     account = (
         await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))
@@ -1134,6 +1325,11 @@ async def _get_owned_open_position(session, telegram_id: int, pos_id: int) -> Pa
             )
         )
     ).scalar_one_or_none()
+
+
+async def _get_owned_open_position(session, telegram_id: int, pos_id: int) -> PaperPosition | None:
+    """FIX #4 IDOR: вернуть позицию только если она принадлежит аккаунту текущего юзера."""
+    return await _get_owned_position(session, telegram_id, pos_id)
 
 
 async def _competition_tradeable(session, position: PaperPosition) -> bool:
@@ -1247,7 +1443,7 @@ async def cb_edit_tp_sl_clear(callback: CallbackQuery, session):
         await update_position_tp_sl(session, position, account, None, None)
         await session.commit()
         await callback.message.edit_text(
-            f"{TG_CHECK} <b>TP/SL УБРАНЫ</b>\n\n{position.symbol} {format_side(position.side)} x{position.leverage:g}\n"
+            f"{TG_CHECK} <b>TP/SL УБРАНЫ</b>\n\n{position.symbol} {format_side(position.side)} {fmt_leverage(position.leverage)}\n"
             f"Теперь без TP/SL.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("Назад", "nav:transactions:0", icon=PIN_ID)]]),
