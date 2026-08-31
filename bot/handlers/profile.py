@@ -340,7 +340,7 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
     kb_rows.append([btn("Обновить", f"nav:transactions:{offset}", icon=GREEN_ID, style="success")])
     kb_rows.append([btn("Посмотреть все сделки", "nav:history:0", icon=CHART_ID, style="primary")])
     open_keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-     page_num = offset // limit + 1
+    page_num = offset // limit + 1
     total_pages = (total_active + limit - 1) // limit if total_active else 1
     # Кросс-маржа: запас до ликвидации на уровне аккаунта (общий для всех позиций)
     threshold = cross_liquidation_threshold(account.initial_balance)
