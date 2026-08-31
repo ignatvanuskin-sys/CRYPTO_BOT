@@ -15,6 +15,19 @@ from bot.emojis import (
 )
 from services.bingx_market_data import get_shared_snapshot
 
+# Форматтеры живут в нейтральном services/formatting.py — им пользуются и хендлеры,
+# и пуши из services/. Реэкспорт нужен, чтобы `from bot.views import fmt_money`
+# по-прежнему работал во всех экранах.
+from services.formatting import (  # noqa: F401
+    fmt_leverage,
+    fmt_leverage_move_pct,
+    fmt_money,
+    fmt_pct,
+    fmt_price,
+    fmt_signed_money,
+    format_side,
+)
+
 
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -112,6 +125,29 @@ def fmt_price(value: Decimal | int | float | None, precision: int | None = None)
         return f"${d.quantize(quant):,f}"
     except Exception:
         return f"${d:,.8f}".rstrip("0").rstrip(".")
+
+
+def fmt_leverage(value: Decimal | int | float | None) -> str:
+    """Плечо в едином виде: 'x50', 'x2.5'. Один формат во всех экранах."""
+    if value is None:
+        return "x1"
+    try:
+        d = Decimal(str(value)).normalize()
+    except Exception:
+        return "x1"
+    if d == d.to_integral_value():
+        d = d.quantize(Decimal(1))
+    return f"x{d:f}"
+
+
+def fmt_leverage_move_pct(value: Decimal | int | float | None) -> str:
+    """Процент движения цены без знака: '0.3%', '1.8%'."""
+    if value is None:
+        return "—"
+    d = Decimal(str(value)).normalize()
+    if d == d.to_integral_value():
+        d = d.quantize(Decimal(1))
+    return f"{d:f}%"
 
 
 def format_side(side) -> str:
