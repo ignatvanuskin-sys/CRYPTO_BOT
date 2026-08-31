@@ -201,6 +201,31 @@ async def cmd_history(message: Message, session):
     await _send_history(message.from_user.id, session, message)
 
 
+@router.message(Command("help", ignore_case=True))
+@router.message(Command("помощь", ignore_case=True))
+@router.message(Command("pomosh", ignore_case=True))
+async def cmd_help(message: Message, session):
+    if message.from_user is None:
+        return
+    _trade_state.pop(message.from_user.id, None)
+    text = (
+        f"{TG_CHART} <b>КАК ЭТО РАБОТАЕТ</b>\n\n"
+        f"1. Выбираешь монету\n"
+        f"2. Выбираешь LONG или SHORT\n"
+        f"3. Указываешь маржу\n"
+        f"4. При желании ставишь TP/SL\n"
+        f"5. Открываешь сделку\n"
+        f"6. Следишь за PnL\n"
+        f"7. Закрываешь позицию\n\n"
+        f"{TG_LONG} <b>LONG</b> — заработок при росте цены.\n\n"
+        f"{TG_SHORT} <b>SHORT</b> — заработок при падении цены.\n\n"
+        f"{TG_STAR} <b>TP</b> — автоматически фиксирует прибыль при достижении цели.\n\n"
+        f"🛡 <b>SL</b> — автоматически закрывает позицию, чтобы ограничить убыток.\n\n"
+        f"Все деньги виртуальные, цены реальные (BingX)."
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=main_menu())
+
+
 async def _send_profile(telegram_id: int, session, target: Message | CallbackQuery):
     """Shared profile renderer for message and callback."""
     is_callback = isinstance(target, CallbackQuery)
@@ -347,7 +372,7 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
     buffer = cross_liquidation_buffer(account.equity, account.initial_balance)
     buffer_pct = cross_liquidation_buffer_pct(account.equity, account.initial_balance)
     header = f"{TG_CHART} <b>АКТИВНЫЕ СДЕЛКИ</b> {page_num}/{total_pages} — всего {total_active}\n"
-    header += f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%) | Порог equity {fmt_money(threshold)}\n"
+    header += f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%)\n"
     lines = [header]
     for p in positions:
         side_str = format_side(p.side)

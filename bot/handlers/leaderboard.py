@@ -298,7 +298,7 @@ async def _build_open_positions(telegram_id: int, session):
     buffer_pct = cross_liquidation_buffer_pct(account.equity, account.initial_balance)
     lines = [
         f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b> — {len(positions)}\n"
-        f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%) | Порог equity {fmt_money(threshold)}\n"
+        f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%)\n"
     ]
     kb_rows = []
     for p in positions:
