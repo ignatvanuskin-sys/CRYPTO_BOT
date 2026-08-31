@@ -115,16 +115,16 @@ async def main() -> None:
 
             await bot.set_my_commands(
                 [
-                    BotCommand(command="start", description="Запуск и верификация номера"),
-                    BotCommand(command="profile", description="Личный кабинет — баланс, ROE, место"),
-                    BotCommand(command="sdelki", description="Активные сделки"),
-                    BotCommand(command="history", description="Все сделки — статистика закрытых"),
-                    BotCommand(command="vse_sdelki", description="Все сделки и статистика"),
+                    # Только по одной команде на функцию — синонимы (/torgovat,
+                    # /pozicii, /vse_sdelki, /сделки) продолжают работать в хендлерах,
+                    # но не засоряют меню "/".
                     BotCommand(command="trade", description="Торговля — выбор монеты и открытие"),
-                    BotCommand(command="torgovat", description="Торговля — выбор монеты и открытие"),
+                    BotCommand(command="sdelki", description="Активные сделки — закрыть, TP/SL"),
+                    BotCommand(command="positions", description="Открытые позиции — цена ликвидации"),
+                    BotCommand(command="history", description="Все сделки — статистика закрытых"),
+                    BotCommand(command="profile", description="Личный кабинет — баланс, ROE, место"),
                     BotCommand(command="top", description="Топ-10 лидеров недели"),
-                    BotCommand(command="positions", description="Открытые позиции"),
-                    BotCommand(command="pozicii", description="Открытые позиции"),
+                    BotCommand(command="start", description="Запуск и верификация номера"),
                 ]
             )
         except Exception as e:

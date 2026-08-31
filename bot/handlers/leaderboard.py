@@ -13,21 +13,25 @@ from sqlalchemy import select
 
 from bot.emojis import (
     BRONZE_ID,
+    CALENDAR_ID,
     CHART_ID,
     CHART_UP_ID,
     CROWN_ID,
     DIAMOND_ID,
     GOLD_ID,
     GREEN_ID,
+    MONEY_ID,
     PIN_ID,
     RED_ID,
     SILVER_ID,
+    SIREN_ID,
     STAR_ID,
     TG_LONG,
     TG_SHORT,
     tg_emoji,
 )
-from bot.views import btn, fmt_money, fmt_pct, main_menu
+from bot.views import btn, fmt_leverage, fmt_leverage_move_pct, fmt_money, fmt_pct, main_menu
+from services.pnl import calc_liquidation_price, liquidation_move_pct
 from db.competition_models import Competition, CompetitionStatus, LeaderboardSnapshot
 from db.models import User
 from services.competition import get_active_competition
@@ -69,7 +73,7 @@ def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dic
     header += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     if not page:
-        return header + "Пока нет участников. Открой первую сделку!"
+        return header + "Пока нет участников. Откройте первую сделку!"
 
     lines = []
     for entry in page:
@@ -169,7 +173,7 @@ async def cmd_top(message: Message, session):
 
     if comp is None:
         await message.answer(
-            f"{TG_CHART} <b>Топ пока пуст</b>\n\nТурнир ещё не начался. Открой сделку — попадёшь в таблицу!",
+            f"{TG_CHART} <b>Топ пока пуст</b>\n\nТурнир ещё не начался. Откройте сделку — попадёте в таблицу!",
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu(),
         )
@@ -203,7 +207,7 @@ async def cmd_top(message: Message, session):
             time_left = f"{days}д {hours}ч"
         else:
             time_left = f"{hours}ч {mins}м"
-        text += f"\n{tg_emoji('5413879192267805083', '🗓')} До итогов: {time_left}"
+        text += f"\n{tg_emoji(CALENDAR_ID, '🗓')} До итогов: {time_left}"
 
     # Pagination for initial view (page 0)
     kb_rows = []
@@ -231,7 +235,7 @@ async def cmd_positions(message: Message, session):
         pass
     content = await _build_open_positions(message.from_user.id, session)
     if content is None:
-        await message.answer("Сначала отправь /start", reply_markup=main_menu())
+        await message.answer("Сначала отправьте /start", reply_markup=main_menu())
         return
     text, markup = content
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -280,7 +284,7 @@ async def _build_open_positions(telegram_id: int, session):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [btn("Посмотреть все сделки", "nav:history:0", icon=CHART_ID, style="primary")],
         ])
-        return (f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажми Торговать, чтобы открыть.", kb)
+        return (f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажмите «Торговать», чтобы открыть.", kb)
 
     lines = [f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b> — {len(positions)}\n"]
     kb_rows = []
@@ -289,10 +293,22 @@ async def _build_open_positions(telegram_id: int, session):
         side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         pnl = p.unrealized_pnl
         pnl_str = fmt_money(pnl)
-        pnl_emoji = tg_emoji(GREEN_ID, "🟢") if pnl > 0 else tg_emoji(RED_ID, "🔴") if pnl < 0 else "⚪️"
+        pnl_emoji = (
+            tg_emoji(GREEN_ID, "🟢") if pnl > 0
+            else tg_emoji(RED_ID, "🔴") if pnl < 0
+            else tg_emoji(MONEY_ID, "💵")
+        )
+        liq = calc_liquidation_price(side_str, p.entry_price, p.leverage, p.quantity, p.notional)
+        liq_line = (
+            f"{tg_emoji(SIREN_ID, '🚨')} Ликвидация {fmt_price(liq)}"
+            f" ({fmt_leverage_move_pct(liquidation_move_pct(p.leverage))})\n"
+            if liq is not None
+            else ""
+        )
         lines.append(
-            f"{side_tag} <b>{p.symbol} {side_str} x{int(p.leverage)} </b> {pnl_emoji} {pnl_str}\n"
+            f"{side_tag} <b>{p.symbol} {side_str} {fmt_leverage(p.leverage)} </b> {pnl_emoji} {pnl_str}\n"
             f"Вход {fmt_price(p.entry_price)} → Сейчас {fmt_price(p.current_price)}\n"
+            f"{liq_line}"
             f"Объём {fmt_money(p.notional)}"
         )
         kb_rows.append([
@@ -359,7 +375,7 @@ async def nav_top(callback: CallbackQuery, session):
         hours, rem = divmod(rem, 3600)
         mins = rem // 60
         time_left = f"{days}д {hours}ч" if days > 0 else f"{hours}ч {mins}м"
-        text += f"\n{tg_emoji('5413879192267805083', '🗓')} До итогов: {time_left}"
+        text += f"\n{tg_emoji(CALENDAR_ID, '🗓')} До итогов: {time_left}"
 
     # Pagination keyboard
     kb_rows = []

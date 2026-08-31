@@ -20,6 +20,7 @@ from bot.emojis import (
     PARTY_ID,
     PIN_ID,
     RED_ID,
+    SIREN_ID,
     STAR_ID,
     TG_CHART,
     TG_CHART_UP,
@@ -34,10 +35,21 @@ from bot.emojis import (
     tg_emoji,
 )
 from bot.keyboards import contact_keyboard
-from bot.views import btn, fmt_money, fmt_pct, fmt_price, format_side, main_menu, safe_edit
+from bot.views import (
+    btn,
+    fmt_leverage,
+    fmt_leverage_move_pct,
+    fmt_money,
+    fmt_pct,
+    fmt_price,
+    format_side,
+    main_menu,
+    safe_edit,
+)
 from db.models import User
 from db.paper_models import PaperPosition, PositionStatus, TradingAccount
 from services.accounts import get_or_create_user, verify_phone
+from services.pnl import calc_liquidation_price, liquidation_move_pct
 from services.competition import get_or_create_default_competition, join_competition
 from services.leaderboard import get_user_rank
 from services.trading_account import get_or_create_trading_account
@@ -331,9 +343,17 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         pnl_line = f"PnL: {fmt_money(p.unrealized_pnl)}"
         status_line = f"{tg_emoji(GREEN_ID, '🟢')} ОТКРЫТА"
+        liq = calc_liquidation_price(side_str, p.entry_price, p.leverage, p.quantity, p.notional)
+        liq_line = (
+            f"{tg_emoji(SIREN_ID, '🚨')} Ликвидация: {fmt_price(liq)}"
+            f" ({fmt_leverage_move_pct(liquidation_move_pct(p.leverage))})\n"
+            if liq is not None
+            else ""
+        )
         lines.append(
-            f"{p.symbol} {side_tag} {side_str} x{p.leverage or 1:g}\n"
+            f"{p.symbol} {side_tag} {side_str} {fmt_leverage(p.leverage)}\n"
             f"Вход: {fmt_price(p.entry_price)} → Сейчас: {fmt_price(p.current_price)}\n"
+            f"{liq_line}"
             f"{pnl_line} | {status_line}"
         )
     # Callback («Обновить»/навигация) — редактируем окно на месте, не создавая новое сообщение
@@ -468,7 +488,7 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
         pnl = p.realized_pnl
         pnl_emoji = tg_emoji(GREEN_ID, "🟢") if pnl > 0 else tg_emoji(RED_ID, "🔴")
         lines.append(
-            f"{p.symbol} {side_tag} {side_str} x{p.leverage or 1:g} {pnl_emoji} {fmt_money(pnl)}\n"
+            f"{p.symbol} {side_tag} {side_str} {fmt_leverage(p.leverage or 1)} {pnl_emoji} {fmt_money(pnl)}\n"
             f"Вход: {fmt_price(p.entry_price)} → Выход: {fmt_price(p.current_price)}  {fmt_pct((pnl / (p.notional / (p.leverage or 1)) * 100) if p.notional else 0)}\n"
             f"{p.closed_at.strftime('%d.%m %H:%M') if p.closed_at else ''}"
         )

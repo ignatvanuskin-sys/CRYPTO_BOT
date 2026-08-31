@@ -1,446 +1,549 @@
-# CryptoBot — Paper Trading Demo на BingX: от А до Я
+# CryptoBot — Полная документация проекта (от А до Я)
 
-> **Статус:** `main` — единый Railway-сервис `python -m bot.main`, демо-баланс $10 000, торговля LONG/SHORT по живым ценам BingX Perpetual (DEMO_WATCHLIST 25 пар, <1с цикл), `paper_positions` + `market_snapshots`, `price_poller/tp_sl_engine/competition_lifecycle` — фоновые `asyncio.create_task` в том же процессе, `liquidation` 90% margin, `max_leverage` per-coin (BTC/ETH 300). Легаси TradeWeek сохранён в ветке `legacy/tradeweek-snapshot`.
+> **Telegram paper-trading бот** на реальных ценах BingX USDⓈ-M Perpetual.
 > **Бот:** `@crypto_demo_vbot` (id `8610467759`)
-> **Проект Railway:** `dynamic-curiosity` (`01e288e4-99a1-4602-b9c9-81549f951b70`), сервис `CRYPTO_BOT` + `Postgres` (`test_railway` для PG-тестов)
+> **Ветка:** `main` · **Railway:** проект `dynamic-curiosity`, сервисы `CRYPTO_BOT` + `Postgres`
+> **Версия документа:** актуальна на коммит `925d36b` (Phase 1 critical fixes задеплоены, деплой `bc976ae9`)
 
 ---
 
-## 1. Идея и сценарий (референс ТЗ)
+## 1. Что это
 
-```
-/start → проверка + request_contact → демо-баланс $10 000 (идемпотентно) → главное меню [Личный кабинет]
-/profile → юзернейм, баланс (equity), успешных/неуспешных, общий ROE, место в рейтинге
-/transactions → все сделки (открытые и закрытые, до 15, с PnL и кнопкой Закрыть)
-/trade → 1) Выбрать монету → ввод тикера → ссылка на график BingX https://bingx.com/en/perpetual/{BASE}-USDT
-        → 2) Быстрое открытие → тикер → бюджет (маржа) → плечо → LONG/SHORT → TP/SL (опционально) → подтверждение → open_position()
-```
+Демо-тренажёр криптотрейдинга: пользователь получает **$10 000 виртуального баланса**, торгует криптопарами **LONG/SHORT с плечом до 300x** по живым ценам BingX, участвует в недельных турнирах, смотрит топ-10 лидеров. Все деньги виртуальные, цены — реальные.
 
-Никаких Mini App, вкладок сверх схемы. ASK/BID-правила, `Decimal`, ledger, отказ при `Market data stale/unavailable` — сохранены.
+Ключевые свойства:
+- **Один процесс** — бот, воркеры и healthcheck живут в одном event loop
+- **Сервер-авторитарность** — цены, PnL, equity, ROI считает сервер, клиент ничего не присылает
+- **Ledger-бухгалтерия** — каждая мутация баланса имеет запись в `account_ledger`
+- **Идемпотентность** — повторный клик/ретрай не создаёт вторую операцию
+- **Изолированная маржа** — убыток не может превысить маржу позиции
+- **PostgreSQL-only** для денег (SQLite только для локальных тестов)
 
 ---
 
 ## 2. Стек
 
-| Слой | Технология | Версия / Примечание |
-|------|------------|---------------------|
-| Язык | Python | `3.11.11` (`runtime.txt`, `nixpacks.toml: python311`) |
-| Бот | aiogram | `3.22.0`, `ParseMode.HTML`, `DefaultBotProperties` |
-| ORM | SQLAlchemy | `2.0.51` async, `asyncpg 0.30.0` / `aiosqlite 0.20.0` |
-| Миграции | Alembic | `1.15.2`, `alembic/env.py` |
-| Биржа | ccxt | `4.3.89` `ccxt.bingx` (`defaultType: swap`) |
-| Конфиг | pydantic-settings | `2.10.1`, `pydantic 2.11.7` |
-| HTTP | httpx | `0.27.2` |
-| Тесты | pytest + pytest-asyncio | `9.1.1` / `1.4.0` |
-| Деплой | Railway | `Railpack` builder, `Procfile`, `nixpacks.toml`, `Postgres 18` |
+| Слой | Технология | Версия |
+|---|---|---|
+| Язык | Python | 3.11 |
+| Бот | aiogram | 3.22.0 |
+| БД | PostgreSQL + SQLAlchemy 2.0 async | 2.0.51 / asyncpg 0.30 |
+| Миграции | Alembic | 1.15.2 (rev `009`) |
+| Биржа | ccxt (`ccxt.bingx`, swap) | 4.3.89 |
+| Конфиг | pydantic-settings | 2.10.1 |
+| Healthcheck | aiohttp | 3.9.5 |
+| Метрики | file-persisted Counter | встроенно |
+| Тесты | pytest + pytest-asyncio | 9.1.1 |
+| Деплой | Railway (Railpack) + Procfile | — |
 
 ---
 
 ## 3. Архитектура — один процесс
 
 ```
-┌─────────────────────────────────────────────┐
-│  bot/main.py (single process, LOCK_KEY)     │
-│  ├─ aiogram Dispatcher + db_middleware      │
-│  │   ├─ profile_router (/start, /profile, /transactions) │
-│  │   ├─ trade_router (/trade, ticker→budget→leverage→side→TP/SL→confirm, close) │
-│  │   └─ admin_router                        │
-│  ├─ asyncio.create_task(price_poller)       │  BingX fetch_tickers → market_snapshots
-│  ├─ asyncio.create_task(tp_sl_engine)       │  bid/ask → TP/SL → close_position
-│  └─ asyncio.create_task(competition_lifecycle) │  finalize_expired_competitions
-└─────────────────────────────────────────────┘
-         │ PostgreSQL advisory lock 82463518 (workers/lock.py)
-         └─ postgres.railway.internal:5432/railway
+                        Telegram (long polling)
+                                │
+                    ┌───────────▼────────────┐
+                    │   bot/main.py          │
+                    │   python -m bot.main   │
+                    │                        │
+                    │  Dispatcher (aiogram)  │
+                    │   ├─ profile_router    │  /start /profile /сделки /история
+                    │   ├─ leaderboard_router│  /top /позиции (+ nav:top/transactions)
+                    │   ├─ trade_router      │  /trade → мастер сделки, close, edit TP/SL
+                    │   └─ admin_router      │  /admin_* (9 команд)
+                    │                        │
+                    │  db_middleware         │  session на каждый апдейт, rollback при ошибке
+                    │  ThrottlingMiddleware  │  0.8с/сообщение, 0.3с/callback на юзера
+                    │                        │
+                    │  ФОНОВЫЕ ЗАДАЧИ        │  (asyncio.create_task, тот же loop)
+                    │   ├─ price_poller      │  BingX → market_snapshots (каждые 2с)
+                    │   ├─ tp_sl_engine      │  mark/LIQ/TP/SL (каждые 1с)
+                    │   ├─ competition_lifecycle │  finalize (каждые 10с)
+                    │   └─ healthcheck       │  aiohttp :8080 /health /metrics
+                    └───────────┬────────────┘
+                                │
+              PostgreSQL (advisory lock 82463518 — singleton)
+              postgres.railway.internal:5432/railway (+ test_railway для тестов)
 ```
 
-Один `BOT_TOKEN`, один `DATABASE_URL`, один `LOCK_KEY=82463518`. Воркеры не отдельный процесс — устраняет причину провала «написанный код не задеплоен».
+**Почему один процесс:** предыдущая итерация имела раздельные воркеры, и часть кода «не была реально задеплоена». Сейчас всё в одном процессе — теряться негде. Singleton через `pg_try_advisory_lock(82463518)` с ретраем 15×2с при rolling-деплое.
+
+**Healthcheck:** `GET /health` → `200 {"status":"ok","bot":"CRYPTO_BOT"}`; `GET /metrics` → счётчики (JSON). Порт `$PORT` (по умолчанию 8080).
 
 ---
 
-## 4. Структура папок
+## 4. Структура репозитория
 
 ```
-C:\TGOD\CryptoBot\
-├── alembic/                      # миграции
-│   ├── env.py                    # env + target_metadata = Base.metadata (db.models, paper_models, competition_models, market_data)
-│   ├── script.py.mako
-│   └── versions/
-│       ├── 001_initial.py        # users, weeks, assets, transactions, orders, positions, leaderboard_snapshots, prizes
-│       ├── 002_paper_trading.py  # trading_accounts, instruments, account_ledger, paper_positions, paper_orders, audit_logs + seed BTC/ETH/SOL
-│       ├── 003_competition.py    # competitions, competition_participants, executions, leaderboard snapshots (paper)
-│       ├── 004_runtime_safety.py # is_simulated, market_snapshots, competition_prizes
-│       ├── 005_paper_leverage.py # paper_positions.leverage
-│       ├── 006_widen_symbols.py  # VARCHAR(20)→40 (NCSINASDAQ1002USDUSDT 22 символа)
-│       └── 007_instrument_max_leverage.py # instruments.max_leverage (BTC/ETH 300, SOL 100, остальные 50)
-├── bot/
-│   ├── main.py                   # 92 строки, single-process, retry lock 15×2с, DefaultBotProperties(HTML)
-│   ├── emojis.py                 # 77 строк, все premium ID из ТЗ, tg_emoji() + TG_LONG/TG_SHORT/... (LONG 5449683594425410231, SHORT 5447183459602669338)
-│   ├── views.py                  # main_menu (ReplyKeyboard premium), back_keyboard, fmt_money/fmt_price/format_side, bingx_chart_url, get_display_snapshot
-│   ├── keyboards.py              # contact_keyboard (request_contact + ENVELOPE_ID)
-│   └── handlers/
-│       ├── __init__.py           # re-export admin_router
-│       ├── profile.py            # 262 строки, /start+contact→grant+competition, /profile, /transactions, nav:home/profile/transactions (исправлен callback.from_user баг)
-│       ├── trade.py              # 617 строк, trade_state dict, LEVERAGES 1..300, safe_trade_error (HTML), confirm→open_position, close_preview/confirm
-│       └── admin.py              # admin_stats/ban/unban/active_competition/create_demo_cup/seed_demo_players/reconcile/finish_competition/product_stats
-├── config.py                     # Settings (BOT_TOKEN, DATABASE_URL, INITIAL_BALANCE_USD=10000, MARKET_DATA_MAX_AGE_MS=10000, PRICE_POLL_INTERVAL=2, ADMIN_IDS, DEMO_*)
-├── db/
-│   ├── base.py                   # declarative_base()
-│   ├── __init__.py               # Base + User
-│   ├── models.py                 # User (telegram_id unique, phone unique, is_banned, is_simulated)
-│   ├── paper_models.py           # TradingAccount, Instrument (max_leverage), AccountLedger, PaperOrder, PaperPosition (leverage), AuditLog
-│   ├── competition_models.py     # Competition, CompetitionParticipant, Execution, LeaderboardSnapshot, CompetitionPrize
-│   └── market_data.py            # MarketSnapshot (symbol PK 40, bid/ask/last, exchange_timestamp, received_at)
-├── services/
-│   ├── accounts.py               # get_or_create_user, verify_phone, ensure_can_trade (ban+phone)
-│   ├── trading_account.py        # get_or_create_trading_account (idempotent, ledger INITIAL_BALANCE), refresh_account_stats (equity=cash+margin+unrealized)
-│   ├── paper_adapter.py          # open_position/close_position (509 строк): ASK/BID, slippage, quantity/notional, leverage, max_leverage check, TP/SL validate, margin, ledger, Execution, idempotency savepoint, FOR UPDATE lock
-│   ├── bingx_market_data.py      # PriceSnapshot, normalize_symbol, validate_snapshot, is_stale, persist_snapshot, get_shared_snapshot (PostgreSQL), get_execution_snapshot (shared+sqlite fallback)
-│   ├── competition.py            # get_active_competition, get_or_create_default_competition (savepoint), join_competition, update_participant_equity, finish_competition
-│   ├── leaderboard.py            # build_leaderboard (ROI sort), get_top_n, get_user_rank, snapshot_leaderboard
-│   ├── pnl.py                    # calc_pnl, calc_unrealized, calc_notional (Decimal 0.01)
-│   ├── demo.py                   # DEMO_PRIZES 10×$100, create_demo_cup, seed_demo_players
-│   ├── notifications.py          # notify_competition_finished (best-effort Bot.send_message)
-│   └── metrics.py                # in-memory Counter increment/snapshot/reset
-├── workers/
-│   ├── lock.py                   # LOCK_KEY 82463518, acquire/release advisory_lock (connection-scoped)
-│   ├── price_poller.py           # 153 строки, sync_instruments (price/quantity precision, max_leverage), fetch_once batch commit, run_forever
-│   ├── tp_sl_engine.py           # check_and_close_positions (savepoint per close), run_forever 1с
-│   └── competition_lifecycle.py  # finalize_competition_session, finalize_expired_competitions (savepoint per competition), run_forever 10с
-├── tests/
-│   ├── conftest.py               # sqlite_engine, pg_engine (TEST_DATABASE_URL→testcontainers), autouse clear _price_cache
-│   ├── test_paper_mvp.py         # bid/ask, stale, competition ended
-│   ├── test_paper_money.py       # leverage margin, insufficient, invalid leverage, idempotent grant
-│   ├── test_shared_market.py     # shared snapshot source of truth, stale/future, finalize skip closed
-│   ├── test_demo_acceptance.py   # LONG ASK / SHORT BID, prizes, finalize idempotent
-│   ├── test_paper_race_pg.py     # PG race same key→1 position, one close, one snapshot
-│   ├── test_product_acceptance.py# premium icons, ticker normalize, chart URL, safe_trade_error HTML, LONG/SHORT IDs
-│   └── test_tp_sl_leverage_price.py # 10 тестов: format_side, fmt_price, per-coin leverage, TP/SL triggers, low-price UB
-├── docs/ANTI_CHEAT_AUDIT.md
-├── outputs/                      # старые отчёты (BOT_FROM_A_TO_Z..., FINAL..., client-ready)
-├── ACCEPTANCE_EVIDENCE.md        # прод-прогон на Railway (951 снапшот, 2.1с age, acceptance script)
-├── MANUAL_TESTING.md             # чек-лист раздела 3
-├── CRYPTOBOT_A_TO_Z.md           # этот файл
-├── Procfile                      # web: PYTHONPATH=/app alembic upgrade head && PYTHONPATH=/app python -m bot.main
-├── nixpacks.toml                 # [phases.setup] python311, [phases.install] pip install -r requirements.txt, [start] alembic...
-├── runtime.txt                   # python-3.11.11
-├── requirements.txt              # в т.ч. ccxt, aiogram, asyncpg
-├── pytest.ini                    # asyncio_mode = auto
-├── .env.example                  # шаблон без секретов
-├── alembic.ini
-└── tradeweek.db                  # локальный sqlite (игнор)
+bot/
+  main.py               # входная точка: Bot, Dispatcher, фоновые задачи, healthcheck
+  emojis.py             # premium emoji ID (LONG/SHORT/...) + tg_emoji() helper
+  views.py              # btn(), fmt_money/fmt_price/fmt_pct/format_side, main_menu, safe_edit
+  keyboards.py          # contact_keyboard (request_contact)
+  middlewares/throttling.py  # rate-limit per user
+  handlers/
+    profile.py          # /start, /profile, /сделки (активные), /история (все+статистика)
+    trade.py            # /trade: мастер сделки, подтверждение, закрытие, редактор TP/SL
+    leaderboard.py      # /top (таблица лидеров), /positions (открытые позиции)
+    admin.py            # 9 админ-команд
+services/
+  paper_adapter.py      # ЯДРО: open_position, close_position, update_position_tp_sl
+  bingx_market_data.py  # PriceSnapshot, validate, persist, get_execution_snapshot
+  trading_account.py    # счёт, refresh_account_stats (equity/ROI)
+  competition.py        # турниры: create/join/equity/finish (clean-sheet reset)
+  leaderboard.py        # build_leaderboard (3 SQL-запроса, read-only)
+  accounts.py           # get_or_create_user, verify_phone, ensure_can_trade
+  pnl.py                # calc_pnl, calc_unrealized, calc_notional
+  demo.py               # DEMO_PRIZES, create_demo_cup, seed_demo_players
+  notifications.py      # уведомление об итогах турнира
+  metrics.py            # счётчики (in-memory + file persist, debounce 10с)
+workers/
+  price_poller.py       # синк инструментов + батч-поллинг цен
+  tp_sl_engine.py       # mark-to-market + liquidation + TP/SL (пагинация 500)
+  competition_lifecycle.py  # финализация истёкших турниров
+  lock.py               # advisory lock
+db/
+  models.py             # User
+  paper_models.py       # TradingAccount, Instrument, AccountLedger, PaperOrder, PaperPosition, AuditLog
+  competition_models.py # Competition, Participant, Execution, Snapshot, Prize
+  market_data.py        # MarketSnapshot
+alembic/versions/       # 001…009
+tests/                  # 68 тестов (61 passed / 7 skipped локально)
+docs/ANTI_CHEAT_AUDIT.md, AUDIT_DEEP_REPORT.md, AUDIT_REPORT_V2.md
+Procfile, nixpacks.toml, runtime.txt, pytest.ini
+```
 
 ---
 
-## 5. Конфигурация (`config.py:5`)
+## 5. Конфигурация (env)
 
-| ENV | Default | Назначение |
-|-----|---------|------------|
-| `BOT_TOKEN` | `""` | aiogram Bot |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./paper.db` | `postgresql+asyncpg` в проде, `database_url_async` конвертирует `postgresql://` |
-| `REQUIRE_POSTGRES` | `false` | fail если не Postgres |
-| `INITIAL_BALANCE_USD` | `10000` | демо-грант |
-| `MARKET_DATA_MAX_AGE_MS` | `3000` | stale-порог для `get_execution_snapshot` (25 пар → <1с цикл, было 10000 для 951) |
-| `PRICE_POLL_INTERVAL_SECONDS` | `2` | `poll_prices` sleep |
-| `BINGX_MARKET_TYPE` | `perpetual` | `swap` для ccxt |
-| `PAPER_SLIPPAGE_BPS` | `0` | |
-| `ADMIN_TELEGRAM_IDS` | `""` | comma `1,2,3` → `admin_ids_set` |
-| `DEMO_SEED_ENABLED` | `false` | `admin_create_demo_cup/seed_demo_players` |
-| `DEMO_PLAYER_COUNT` | `20` | |
-| `DEMO_CUP_DURATION_HOURS` | `24` | |
-| `DEMO_PRIZE_POOL` | `100` | |
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `BOT_TOKEN` | — | токен бота (обязателен) |
+| `DATABASE_URL` | sqlite | `postgresql://…` → конвертируется в `+asyncpg` |
+| `REQUIRE_POSTGRES` | false | fail-fast, если не Postgres |
+| `INITIAL_BALANCE_USD` | 10000 | демо-грант при /start |
+| `PAPER_SLIPPAGE_BPS` | 0 | проскальзывание (0 = по рынку) |
+| `BINGX_MARKET_TYPE` | perpetual | swap |
+| `MARKET_DATA_MAX_AGE_MS` | 6000 | порог устаревания цены |
+| `PRICE_POLL_INTERVAL_SECONDS` | 2 | интервал опроса |
+| `ADMIN_TELEGRAM_IDS` | — | admin через запятую |
+| `DEMO_SEED_ENABLED` | false | включение демо-команд |
+| `DEMO_PLAYER_COUNT/CUP_DURATION_HOURS/PRIZE_POOL` | 20/24/100 | параметры демо-кубка |
+| `METRICS_PATH` / `METRICS_PERSIST_INTERVAL` | metrics.json / 10 | персист метрик |
 
-`extra="ignore"` — старые `TRADING_MODE/WEEKLY_GRANT/PRIZE_TOP_N/WEBAPP_URL` игнорируются.
+Railway переменные: `BOT_TOKEN`, `DATABASE_URL` (internal), `MARKET_DATA_MAX_AGE_MS=6000`, `PYTHONPATH=/app`.
 
 ---
 
 ## 6. База данных
 
-### 6.1 `users` (`db/models.py:14`)
-`id PK`, `telegram_id BIGINT UNIQUE`, `username`, `phone_number TEXT UNIQUE`, `phone_verified_at`, `is_banned`, `is_simulated`, `ban_reason`, `created_at`. FK для всех остальных.
+### users
+`id`, `telegram_id` (UNIQUE), `username`, `phone_number` (UNIQUE), `phone_verified_at`, `is_banned`, `is_simulated`, `ban_reason`, `created_at`
 
-### 6.2 `instruments` (`paper_models.py:66`)
-`symbol PK VARCHAR(40)` (BTCUSDT), `base_asset/quote_asset`, `status` enum, `price_precision/quantity_precision INT`, `min_quantity NUMERIC(30,12)`, `max_quantity`, `max_leverage INT default 50` (007: BTC/ETH 300, SOL 100), `created_at`.
+### trading_accounts (1:1 к юзеру)
+| Поле | Тип | Смысл |
+|---|---|---|
+| `initial_balance` | NUMERIC(18,2) | 10000 — стартовый грант |
+| `cash_balance` | NUMERIC(18,2) | свободные деньги |
+| `margin_used` | NUMERIC(18,2) | зарезервировано под открытые позиции |
+| `equity` | NUMERIC(18,2) | cash + margin_used + unrealized_pnl |
+| `available_margin` | NUMERIC(18,2) | = cash_balance |
+| `realized_pnl` / `unrealized_pnl` / `total_pnl` | NUMERIC(18,2) | PnL |
 
-### 6.3 `trading_accounts` (`paper_models.py:50`)
-`id PK`, `user_id UNIQUE FK`, `currency USD`, `initial_balance/cash_balance/equity/margin_used/available_margin/realized_pnl/unrealized_pnl/total_pnl NUMERIC(18,2)`, `created_at/updated_at`. Один счёт на юзера, `equity = cash + margin_used + unrealized`.
+### account_ledger (журнал,append-only)
+`id`, `account_id`, `type` (`INITIAL_BALANCE|TRADE_OPEN|TRADE_CLOSE|FEE|ADJUSTMENT`), `amount`, `balance_after`, `reference_type`, `reference_id`, `idempotency_key` (UNIQUE), `created_at`
 
-### 6.4 `account_ledger` (`paper_models.py:78`)
-`id PK`, `account_id FK`, `type` enum `INITIAL_BALANCE/TRADE_OPEN/TRADE_CLOSE/FEE/ADJUSTMENT`, `amount/balance_after NUMERIC(18,2)`, `reference_type/reference_id`, `idempotency_key TEXT UNIQUE`, `created_at`. `balance_after >=0`.
+**Инвариант:** `SUM(amount) == cash_balance` — проверяется тестами.
+**CHECK:** `balance_after >= 0`.
 
-### 6.5 `paper_positions` (`paper_models.py:113`)
-`id PK`, `account_id FK`, `competition_id FK`, `symbol FK 40`, `side` enum LONG/SHORT, `status` enum OPEN/CLOSED..., `quantity/entry_price/current_price NUMERIC(30,12)`, `notional NUMERIC(18,2)` (=price*qty), `leverage NUMERIC(10,2) default 1`, `take_profit/stop_loss`, `realized/unrealized_pnl`, `fee_open/close`, `opened_at/closed_at`. Индексы `account_status`, `symbol`, `competition`.
+### instruments
+`symbol` (PK, VARCHAR(40)), `base_asset`, `quote_asset`, `status`, `price_precision`, `quantity_precision`, `min_quantity`, `max_quantity`, `max_leverage` (INT; BTC/ETH=300, SOL=100, остальные 50)
 
-### 6.6 `paper_orders` (`paper_models.py:95`)
-`id PK`, `account_id FK`, `position_id FK`, `symbol FK 40`, `side/order_type/status/reduce_only`, `quantity/requested/executed_price NUMERIC(30,12)`, `idempotency_key UNIQUE`, `rejection_reason`, `created_at/executed_at`.
+### paper_positions
+`id`, `account_id`, `competition_id`, `symbol`, `side` (`LONG|SHORT`), `status` (`OPEN|CLOSED|…`), `quantity`, `entry_price`, `current_price`, `notional`, `leverage` (NUMERIC(10,2)), `take_profit`, `stop_loss`, `realized_pnl`, `unrealized_pnl`, `fee_open/close`, `opened_at`, `closed_at`
 
-### 6.7 `market_snapshots` (`market_data.py:16`)
-`symbol PK 40`, `source BINGX`, `market_type PERPETUAL`, `bid/ask/last NUMERIC(30,12)`, `exchange_timestamp/received_at/updated_at TIMESTAMPTZ`, `CHECK ask>=bid`.
+### paper_orders
+`id`, `account_id`, `position_id`, `symbol`, `side`, `quantity`, `requested_price`, `executed_price`, `status` (`PENDING|FILLED|REJECTED`), `reduce_only`, `idempotency_key` (**UNIQUE**), `rejection_reason`
 
-### 6.8 `competitions` (`competition_models.py:25`)
-`id PK`, `name`, `status` UPCOMING/ACTIVE/FINISHED/CANCELLED, `starts_at/ends_at`, `initial_balance/prize_pool`, `ranking_metric ROI`, `price_source BINGX`, `market_type USD_M_PERPETUAL`.
+### market_snapshots
+`symbol` (PK), `source` (BINGX), `market_type` (PERPETUAL), `bid`, `ask`, `last`, `exchange_timestamp`, `received_at`. CHECK: `bid>0`, `ask>=bid`.
 
-### 6.9 `competition_participants` (`competition_models.py:39`)
-`id PK`, `competition_id FK`, `user_id FK`, `starting/current_equity`, `realized/unrealized_pnl`, `roi NUMERIC(10,4)`, `rank`, `joined_at`, `UNIQUE(competition_id,user_id)`.
+### competitions / competition_participants / executions / competition_leaderboard_snapshots / competition_prizes / audit_logs
+Турниры, участники (`UNIQUE(comp,user)`, `starting_equity`, `current_equity`, `roi`, `rank`), иммутабельные исполнения (`OPEN|MANUAL_CLOSE|TAKE_PROFIT|STOP_LOSS|LIQUIDATION`), снапшоты (`UNIQUE(comp,user)`), призы (`UNIQUE(comp,rank)`).
 
-### 6.10 `executions` (`competition_models.py:57`)
-`id PK`, `position_id FK`, `user_id FK`, `competition_id FK`, `symbol/side`, `price_source/market_type`, `bid/ask/execution_price/quantity/notional`, `market_timestamp/requested_at/executed_at`, `execution_reason OPEN/MANUAL_CLOSE/TAKE_PROFIT/STOP_LOSS`.
-
-### 6.11 `competition_leaderboard_snapshots` / `competition_prizes` / `audit_logs`
-
-Миграции `001→007` (Alembic). `Base.metadata.create_all` в тестах, `alembic upgrade head` в проде (`Procfile`).
-
----
-
-## 7. Services — денежная логика
-
-### `services/paper_adapter.py` (509 строк)
-- `PaperError`, `InsufficientMargin`, `InvalidSymbol/Quantity/TP_SL`
-- `_lock_account` — `SELECT ... FOR UPDATE` на `trading_accounts` (Postgres), no-op на sqlite
-- `_validate_tp_sl(side, entry, tp, sl)` — LONG TP>entry SL<entry, SHORT наоборот
-- `_resolve_idempotent_position` — по `idempotency_key` находит `PaperOrder` → `PaperPosition`
-- `open_position(session, account, symbol, side, quantity/notional, tp/sl, idempotency_key!, notional, competition_id, requested_at, leverage=1)`:
-  1. idempotency pre-check → `idempotency_hit`
-  2. competition active (`starts_at<=now<ends_at`) или `Competition ended`
-  3. `side` LONG/SHORT, `leverage` `1..300`, `Instrument` active (dash fallback)
-  4. `get_execution_snapshot(session, symbol, market_data_max_age_ms)` → `snap.bid/ask` → **LONG OPEN=ASK, SHORT OPEN=BID**
-  5. slippage, `quantity = notional/price` или `quantity`, `min/max` checks, `_validate_tp_sl`
-  6. `await _lock_account`, `refresh(account)`, re-check idempotency (race)
-  7. `notional = price*qty`, `required_margin = notional/leverage`, `available_margin` check → `REJECTED` order + `InsufficientMargin`
-  8. `begin_nested()` savepoint: `PaperOrder FILLED` + `PaperPosition OPEN` (notional, leverage) + `Execution(OPEN)` → `cash_balance-=margin`, `margin_used+=margin`, `AccountLedger TRADE_OPEN -margin`, `refresh_account_stats` → `trade_opened`
-- `close_position(session, position, account, idempotency_key!, reason=manual/TP/SL)`:
-  1. idempotency pre-check (retry → same `realized_pnl`)
-  2. `status==OPEN` else `Position not open`
-  3. `get_execution_snapshot` → **LONG CLOSE=BID, SHORT CLOSE=ASK** → `close_price`
-  4. `lock`, `refresh`, `qty` PnL `calc_pnl(side, entry, close, qty)` → `net = gross - fees`
-  5. `begin_nested()` → `PaperOrder FILLED reduce_only` → `position CLOSED`, `current_price=close`, `realized_pnl=net`, `Execution(MANUAL_CLOSE/TAKE_PROFIT/STOP_LOSS)` → `returned_margin = notional/leverage`, `return_amount = margin+net`, `cash+=return`, `margin_used-=margin`, `realized_pnl+=net`, `AccountLedger TRADE_CLOSE +return`, `refresh_account_stats` → `trade_closed`
-
-### `services/trading_account.py`
-- `get_or_create_trading_account(user_id)` — `SELECT` else `begin_nested()` insert `TradingAccount` + `AccountLedger INITIAL_BALANCE` (idempotent, `IntegrityError` → re-read)
-- `refresh_account_stats(account)` — `sum(unrealized_pnl)` по OPEN, `equity=cash+margin+unrealized`, `available_margin=cash`, `total_pnl=realized+unrealized`
-
-### `services/bingx_market_data.py` (187 строк)
-- `PriceSnapshot(symbol, bid/ask/last, exchange_timestamp, received_at, source=BINGX)`
-- `normalize_symbol("BTC/USDT:USDT"→"BTCUSDT")`, `_cache_key("BINGX:PERPETUAL:BTC-USDT")`, `_price_cache` (3 ключа), `get_snapshot`, `update_snapshot`
-- `validate_snapshot` — bid/ask/last finite >0, `ask>=bid`, `exchange_timestamp` не в будущем
-- `is_stale(snapshot, max_age_ms)` — `now - exchange_timestamp > max_age` или `<-5с`
-- `persist_snapshot(session, snap)` — upsert `MarketSnapshot` (validate)
-- `get_shared_snapshot(session, symbol, max_age_ms)` — `SELECT MarketSnapshot` → validate → stale check
-- `get_execution_snapshot(session, symbol, max_age_ms)` — `get_shared_snapshot` или (sqlite) `get_snapshot` fallback
-
-### `services/competition.py`
-- `get_active_competition`, `get_or_create_default_competition` (`pg_advisory_xact_lock 82463519`, `begin_nested` savepoint на race), `join_competition` (savepoint, `competition_joined`), `update_participant_equity` (`current_equity=cash+margin+unrealized`, `roi`), `finish_competition` (freeze `FINISHED`, `build_leaderboard`, `snapshot_leaderboard` один раз, `CompetitionPrize` для `DEMO TRADING CUP`)
-
-### `services/leaderboard.py`
-- `build_leaderboard` — пересчёт `current_equity/roi` для всех `CompetitionParticipant`, сортировка `roi→equity→joined_at→user_id`, проставляет `rank`
-- `get_top_n`, `get_user_rank` (с `need_for_top10`), `snapshot_leaderboard`
-
-### `services/pnl.py`
-- `calc_pnl(side, entry, exit, qty)` → `(exit-entry)*qty` LONG, `(entry-exit)*qty` SHORT, `quantize 0.01`
-- `calc_unrealized`, `calc_notional(price*qty)`
-
-### `services/accounts.py`
-- `get_or_create_user(telegram_id, username)`, `verify_phone(user, phone)`, `ensure_can_trade(user)` (ban/phone)
-
-### `services/demo.py`
-- `DEMO_PRIZES=[50,25,15,1.43×6,1.42]` sum 100, `create_demo_cup` (reuse пустого ACTIVE), `seed_demo_players` (telegram_id `-900...`, `is_simulated`)
-
-### `services/metrics.py` / `notifications.py`
-- `Counter increment/snapshot/reset` (thread-safe `Lock`)
-- `notify_competition_finished(engine, competition_id)` — best-effort `Bot.send_message` топу
+### Миграции
+`001` legacy → `002` paper → `003` competition → `004` snapshots/prizes → `005` leverage → `006` VARCHAR(40) symbols → `007` max_leverage → `008` LIQUIDATION enum → `009` индексы. Голова: **009**.
 
 ---
 
-## 8. Bot
+## 7. ДЕНЕЖНЫЕ ФОРМУЛЫ (все)
 
-### `bot/main.py:23`
-- `Bot(token, DefaultBotProperties(parse_mode=HTML))`, `create_async_engine(database_url_async)`, `acquire_advisory_lock(LOCK_KEY)` с ретраем `15×2с` (rolling deploy), `async_sessionmaker`, `Dispatcher` + `db_middleware(session)` с `try/rollback`, `include_router(profile/trade/admin)`, `create_task(price_poller/tp_sl_engine/competition_lifecycle)`, `asyncio.wait(FIRST_COMPLETED)` + graceful cancel/release.
+Обозначения: `E` — цена входа (entry), `X` — цена выхода, `Q` — количество, `N` — notional, `M` — маржа, `L` — плечо, `B` — бюджет (маржа, вводит юзер).
 
-### `bot/emojis.py`
-- Все ID из ТЗ: `LONG 544968...`/`SHORT 544718...` + 40 остальных, `tg_emoji(id, fallback)` → `<tg-emoji emoji-id="...">...</tg-emoji>`, константы `TG_LONG` etc., fallback обычные emoji только внутри тега.
-
-### `bot/views.py`
-- `main_menu()` — `ReplyKeyboardMarkup` `Торговать` (`CHART_UP_ID`) / `Личный кабинет` (`CROWN_ID`)
-- `back_keyboard(target)` — `InlineKeyboardButton Назад` (`PIN_ID`)
-- `fmt_money` (`$1,234.56`), `fmt_price(value, precision)` (авто: `>=1000→2`, `>=1→4`, `>=0.1→6`, `<0.1→8` знаков, или `quantize` по `price_precision`), `format_side(side)` (`PositionSide` enum→`LONG`/`SHORT`), `bingx_chart_url(symbol)` → `https://bingx.com/en/perpetual/{BASE}-USDT`, `get_display_snapshot(session, symbol)` (`market_data_max_age_ms`)
-
-### `bot/keyboards.py`
-- `contact_keyboard()` — `KeyboardButton Поделиться номером request_contact + ENVELOPE_ID`
-
-### `bot/handlers/profile.py` (262 строки)
-- `_get_user_by_telegram_id`, `_grant_demo_balance`, `_ensure_competition`, `send_main_menu`
-- `cmd_start` — `get_or_create_user`, если `phone_verified_at is None` → `contact_keyboard`, иначе grant+competition → `TG_PARTY/ TG_MONEY/ TG_CROWN` приветствие
-- `handle_contact` — `contact.user_id==from_user.id`, `verify_phone` + grant + `join_competition`, `unique` → `Этот номер уже...`, иначе `TG_CHECK` подтверждение
-- `_send_profile` / `cmd_profile` (`/profile`, `Личный кабинет`) — `TradingAccount`, `PaperPosition` (wins `realized>0`), `get_user_rank` → `TG_CROWN ЛИЧНЫЙ КАБИНЕТ`, `TG_MONEY баланс`, `TG_CHART сделки`, `TG_STAR rank`, inline `Сделки`/`Торговать` (premium icons)
-- `_send_transactions` / `cmd_transactions` (`/transactions`, `Сделки`) — `PaperPosition` 15 последних, `format_side`, `fmt_price` для цен (исправлен `PositionSide.LONG` баг и `$0.14` → `$0.140000` для `UB`), `GREEN/RED` статус, inline `Закрыть {symbol} {side}` (`RED_ID`) + `Торговать`
-- `nav_home/profile/transactions` — `callback.from_user.id` (исправлен баг `callback.message.from_user`), `trade_state` очистка, `ParseMode.HTML`
-
-### `bot/handlers/trade.py` (617 строк)
-- `trade_state: dict[int,dict]`, `LEVERAGES=["1","2","5","10","20","50","100","150","300"]` (расширено под 300x), `TG_*` константы, `_strip_tags`, `safe_trade_error` (HTML с `WARNING_ID`)
-- `trade_menu_keyboard` — `Выбрать монету` (`DIAMOND_ID`), `Быстрое открытие` (`BOOM_ID`)
-- `leverage_keyboard` — 2 ряда (`GEAR_ID`), `side_keyboard` — `LONG`/`SHORT` (`LONG/SHORT ID`), `tp_sl_keyboard` — `STAR_ID`/`FREE_ID`, `confirm_keyboard` — `CHECK_ID`
-- `normalize_ticker`, `_validate_instrument`, `_account_line`
-- `cmd_trade` (`/trade`, `Торговать`) — меню, `nav_trade` (clear trade_state)
-- `cb_coin_select`/`cb_quick_open` — `awaiting ticker_chart/ticker_trade`
-- `handle_trade_text` (`F.text`) — единая точка ввода: `from_user None` guard, `/` и `Личный кабинет/Сделки/Торговать` → `pop` + return, `ticker_chart`→ validate `Instrument` → `get_display_snapshot` → `fmt_price` + `bingx_chart_url` + `Открыть сделку` (`BOOM_ID`), `ticker_trade`→`awaiting budget` + `_account_line`, `budget`→`awaiting leverage` + `leverage_keyboard`, `tp_sl`→`skip` или `TP SL` → `_show_confirmation`
-- `_show_confirmation` — `snapshot.ask/bid`, `notional=budget*leverage`, `side_tag TG_LONG/TG_SHORT`, `state_line` цена входа, `TG_STAR TP`/`RED SL` via `fmt_price`, `confirm_keyboard`
-- `cb_quick_symbol`/`cb_re_leverage`/`cb_leverage`/`cb_side`/`cb_tp_sl` — все с `from_user/message is None` guard, `edit_text` HTML
-- `cb_confirm` (`trade:confirm`) — `in_flight` guard, `ensure_can_trade`, `get_or_create_trading_account`, `get_or_create_default_competition`, `join_competition`, `open_position(..., leverage, notional=budget*leverage, idempotency_key=tg:{callback.id})` → `update_participant_equity`, `commit`, `pop` state, `TG_CHECK ПОЗИЦИЯ ОТКРЫТА` + `Мои сделки`/`Торговать` inline; `except` → `safe_trade_error` HTML + `_strip_tags` для alert
-- `cb_cancel` — `pop` + `Сделка отменена.`
-- `cb_close_preview`/`cb_close_confirm` (`close_preview:{id}`/`close_confirm:{id}`) — `from_user/message` guard, `get_display_snapshot`, `bid` LONG / `ask` SHORT, `calc PnL`, `TG_SIREN ЗАКРЫТИЕ`, `Да, закрыть` (`CHECK_ID`) / `Отмена` (`CROSS_ID`), `close_position(..., tg_close:{id})` → `TG_CHECK ПОЗИЦИЯ ЗАКРЫТА`
-
-### `bot/handlers/admin.py`
-- `is_admin`, `admin_stats` (`Users`/`Paper positions`), `admin_ban/unban` (`is_banned`), `admin_active_competition`, `admin_create_demo_cup/seed_demo_players` (`DEMO_SEED_ENABLED`), `admin_reconcile` (`build_leaderboard`), `admin_finish_competition` (`finalize_competition_session` + `notify`), `admin_product_stats` (metrics) — все с `from_user is None or not is_admin` guard, `TG_CHECK/WARNING/CHART/SIREN`
-
----
-
-## 9. Workers
-
-### `workers/lock.py`
-- `LOCK_KEY=82463518`, `acquire_advisory_lock(engine, key, owner)` — `pg_try_advisory_lock` (connection-scoped, не закрывать до `release`), `release_advisory_lock`
-
-### `workers/price_poller.py` (153 строки)
-- `_max_leverage_for_symbol` (BTC/ETH 300, SOL 100, остальные 50), `sync_instruments(engine)` — `load_markets` swap, `normalize_symbol`, `USDT` only, `price_precision/quantity_precision/min_quantity` из `market['precision'/'limits']`, `max_leverage` upsert (`Instrument`) с `begin_nested` per symbol, `logger.warning` на скип
-- `fetch_once(exchange, engine)` — `fetch_tickers` retry 3× backoff 0.5/1/2с, `PriceSnapshot` per ticker, `validate_snapshot`, `update_snapshot` (local cache), `persist_snapshot` в `market_snapshots` batch `async with factory() as session: for ... await persist ...; await commit`, `consecutive_failures/last_alert_at` (5)
-- `poll_prices(engine)` — `swap`/`perpetual`, `while True: fetch_once; sleep(price_poll_interval_seconds)`
-- `run_forever(engine)` — `sync_instruments` + `poll_prices`
-
-### `workers/tp_sl_engine.py` (118 строк)
-- `check_and_close_positions(engine)` — `SELECT PaperPosition OPEN`, per position `get_execution_snapshot` (stale→`stale_price_rejected`, unavailable→`bingx_error`), `close_price = bid LONG / ask SHORT`, `current_price/unrealized_pnl = calc_unrealized`, `refresh_account_stats`, `reason` TP/SL (`LONG TP>=take_profit` etc.), `begin_nested()` → `close_position(..., tp_sl:{id}:{ts}:{reason})`, `increment tp/sl_triggered`
-- `run_forever` — `while True: check_and_close_positions; sleep 1` + `CancelledError`/`logger.exception`
-
-### `workers/competition_lifecycle.py` (107 строк)
-- `finalize_competition_session(session, competition_id)` — `SELECT ... FOR UPDATE`, `SELECT PAPER_POSITION OPEN WHERE competition_id`, per `close_position(..., competition_end:{comp}:{pos})` (PaperError → refresh + skip если уже CLOSED), `finish_competition`
-- `finalize_expired_competitions(engine)` — `SELECT Competition ACTIVE ends_at<=now FOR UPDATE`, per competition `begin_nested()` → `finalize_competition_session` + `commit` на успех, `notify_competition_finished` после коммита
-- `run_forever` — `while True: finalize_expired_competitions; sleep 10`
-
----
-
-## 10. Поток market-data → торговля
-
+### 7.1 Открытие позиции
 ```
-ccxt.bingx.fetch_tickers (swap) ──2с──► price_poller.fetch_once
-                                         ├─ validate_snapshot (bid/ask/last >0, ask>=bid, exchange_timestamp не в будущем)
-                                         ├─ update_snapshot (_price_cache, 3 ключа)
-                                         └─ persist_snapshot → market_snapshots (Postgres, batch commit)
-                                                               │
-bot get_display_snapshot ──► get_shared_snapshot (2000→10000ms) ──► UI цена
-services get_execution_snapshot ──► get_shared_snapshot (market_data_max_age_ms) ──► open/close/tp_sl
-                                         └─ sqlite fallback _price_cache (тесты)
+N = B × L                          # объём позиции (notional)
+Q = N / E                          # количество монеты
+M = N / L = B                      # маржа = бюджет
+cash_balance -= M                  # резервирование
+margin_used   += M
+```
+Пример: B=100, L=10, E=100.10 (ASK для LONG) → N=1000, Q=9.99, M=100, cash 10000→9900.
+
+### 7.2 Правила исполнения (спред всегда против трейдера)
+| Направление | OPEN | CLOSE |
+|---|---|---|
+| LONG | **ASK** | **BID** |
+| SHORT | **BID** | **ASK** |
+
+### 7.3 PnL
+```
+LONG:  gross = (X − E) × Q
+SHORT: gross = (E − X) × Q
+net = gross − fee_open − fee_close      # fees = 0 в демо
+```
+Пример: LONG E=100.10, X=101.00 (BID), Q=9.99 → gross = 0.90×9.99 = +8.99.
+
+### 7.4 Закрытие
+```
+M_return = N / L                        # возврат маржи
+return_amount = M_return + net          # что возвращается в cash
+cash_balance += return_amount
+margin_used  -= M_return
+realized_pnl += net
+```
+Пример: M=100, net=+8.99 → return=108.99, cash 9900→10008.99.
+
+### 7.5 Изолированная маржа и гэп (FIX #2)
+Если `return_amount < 0` (гэп глубже ликвидации):
+```
+net = −M                                # убыток ограничен маржой
+return_amount = 0                       # ничего не возвращается
+ADJUSTMENT-запись: amount=0, reference_type='liquidation_gap',
+                   reference_id='{position_id}:gap={|return_amount|}'
+```
+Деньги не создаются и не исчезают: `SUM(ledger) == cash_balance` — всегда. Гэп поглощается «биржей» и полностью аудируется (reference_id + метрика `liquidation_gap_capped`).
+
+### 7.6 Equity и ROI
+```
+equity = cash_balance + margin_used + unrealized_pnl
+ROI    = (equity − starting_equity) / starting_equity × 100
+```
+`starting_equity` = 10000 на каждый турнир (clean-sheet: при входе в новый кубок счёт сбрасывается через `ADJUSTMENT`-ledger, открытые позиции прошлого кубка принудительно закрываются).
+
+### 7.7 Ликвидация (tp_sl_engine)
+```
+margin = N / L
+если unrealized_pnl ≤ −margin × 0.9  →  LIQUIDATION (форс-закрытие)
+```
+Буфер 10%: позиция закрывается раньше, чем убыток превысит маржу — защита от отрицательного баланса. Приоритет: LIQUIDATION > TP/SL.
+
+### 7.8 Unrealized PnL (mark-to-market)
+```
+LONG:  unrealized = (bid − E) × Q       # закрывался бы по BID
+SHORT: unrealized = (E − ask) × Q       # закрывался бы по ASK
+```
+Пересчитывается каждую секунду движком + при каждом открытии/закрытии.
+
+---
+
+## 8. СИСТЕМА TP/SL (profit-based)
+
+### 8.1 Семантика процентов
+**Процент — это доля ПРИБЫЛИ от маржи, а не движение цены.**
+```
+100% = прибыль равна марже (PnL == margin)
+
+LONG TP = E × (1 + pct / (100 × L))
+LONG SL = E × (1 − pct / (100 × L))
+SHORT TP = E × (1 − pct / (100 × L))
+SHORT SL = E × (1 + pct / (100 × L))
 ```
 
-`market_snapshots` — единственный источник истины в проде, локальный `_price_cache` только для `sqlite` тестов.
+### 8.2 Примеры (обязательные)
+| Параметры | Расчёт | Результат |
+|---|---|---|
+| LONG, E=50000, 20%, L=10 | 50000×(1+20/1000) | **TP 51000** |
+| LONG, E=50000, 20%, L=10 | 50000×(1−20/1000) | **SL 49000** |
+| SHORT, E=50000, 20%, L=10 | 50000×(1−20/1000) | **TP 49000** |
+| SHORT, E=50000, 20%, L=10 | 50000×(1+20/1000) | **SL 51000** |
+| LONG, E=100, 20%, L=10 | 100×1.02 | TP 102, SL 98 |
+| LONG, E=100, 100%, L=1 | 100×2 | TP 200 (прибыль = маржа ×1) |
+| LONG, E=100, 100%, L=10 | 100×1.1 | TP 110 |
+
+**НЕЛЬЗЯ путать:** 100% при L=1 — это ×2 к цене, но прибыль ровно 100% маржи. 100% при L=10 — цена ×1.1, прибыль 100% маржи.
+
+### 8.3 Ввод
+- **Знак игнорируется** (магнитуда): `20` = `20%` = `-20` = `-20%` = `+20`
+- **Режимы:** «Точной ценой» (абсолютные цены: `180 160`) и «В процентах» (`5 -3`, `5% -3%` — знак игнорируется)
+- **Одиночные:** `Только TP` / `Только SL` (второй уровень сохраняется прежним)
+- **`skip`** — убрать оба уровня
+- **Zero отклоняется** (`0`, `0%`, `0 5`) — TP==entry невалиден
+- **Malformed** отклоняется (`abc`, `5,5 3,2` — запятая-разделитель → ошибка, `\n`-инъекции невозможны)
+- **Плечо `≤0`** отклоняется до деления (защита от DivisionByZero)
+- **Оба уровня** — два числа: первое TP, второе SL
+- Валидация сервером: `_validate_tp_sl` — LONG: TP>E, SL<E; SHORT: TP<E, SL>E; finite
+
+### 8.4 Редактор TP/SL (открытые позиции)
+Кнопка `TP/SL` у каждой открытой позиции → экран редактора с текущими уровнями → те же режимы (цена/процент, только TP/SL, убрать) → `update_position_tp_sl` с серверной проверкой владения, статуса OPEN и активного турнира.
+
+### 8.5 Исполнение TP/SL (tp_sl_engine, каждые 1с)
+```
+close_price = BID (LONG) / ASK (SHORT)   # серверный снапшот
+если unrealized ≤ −margin×0.9            → LIQUIDATION (приоритет)
+иначе если price ≥ TP (LONG) / ≤ TP (SHORT) → TP
+иначе если price ≤ SL (LONG) / ≥ SL (SHORT) → SL
+```
+Каждая страница позиций (500) — отдельная сессия+commit; close внутри `begin_nested`; liquidation/TP/SL — отдельные `ExecutionReason`.
 
 ---
 
-## 11. Торговые инварианты
+## 9. ИСПОЛНЕНИЕ И ИДЕМПОТЕНТНОСТЬ
 
-- `Decimal` везде, `float` нигде в деньгах/PnL
-- Баланс — ledger `SUM(account_ledger)`, не поле; `cash_balance/margin_used/equity` — материализованный кэш, `refresh_account_stats`
-- `SELECT ... FOR UPDATE` на `trading_accounts` (`_lock_account`)
-- `idempotency_key UNIQUE` на `paper_orders`/`account_ledger` + `begin_nested()` savepoint → `same key = same result`, двойной тап не создаёт 2 позиции (`tg:{callback.id}`, `in_flight`)
-- Исполнение только по серверной цене в момент обработки (`get_execution_snapshot`), отказ `Market data stale/unavailable`
-- `UNIQUE(competition_id,user_id)` + `advisory_xact_lock` → один `CompetitionParticipant` на кубок
-- `CHECK balance_after>=0`, `quantity>0`
-- `TP/SL` валидация `_validate_tp_sl` + `tp_sl_engine` bid/ask
+### 9.1 Порядок open_position (атомарно)
+```
+1. валидации (сторона, плечо 1..300 + max_leverage инструмента, TP/SL)
+2. snapshot (stale → отказ «Рынок недоступен»)
+3. цена = ASK/BID по стороне
+4. quantity = notional / цена, min/max checks
+5. SELECT FOR UPDATE на trading_accounts
+6. re-check idempotency ПОСЛЕ lock (видит коммит конкурента)
+7. margin check (required ≤ available) → иначе REJECTED-order
+8. begin_nested: PaperOrder FILLED + PaperPosition + Execution
+                  + cash−margin + ledger + refresh_stats   ← ВСЁ В ОДНОМ SAVEPOINT
+9. IntegrityError → savepoint rollback → _resolve_idempotent_position
+10. (в handler) commit
+```
 
----
+### 9.2 Порядок close_position (атомарно)
+```
+1. pre-check idempotency key / статус OPEN
+2. snapshot → close_price = BID/ASK
+3. SELECT FOR UPDATE на trading_accounts
+4. refresh → повторный статус-чек (защита от double-close с ЛЮБЫМИ ключами)
+5. begin_nested: PaperOrder reduce_only + position CLOSED + Execution
+                 + gap-cap + cash+return + ledger TRADE_CLOSE (+ADJUSTMENT)
+                 + refresh_stats                              ← ОДИН SAVEPOINT
+6. IntegrityError → rollback savepoint → идемпотентный ответ
+```
 
-## 12. Premium эмодзи
+### 9.3 Ключи идемпотентности
+| Операция | Ключ | Защита |
+|---|---|---|
+| OPEN | `tg:{callback.id}` | UNIQUE paper_orders + re-check после lock |
+| CLOSE (manual) | `tg_close:{callback.id}` | UNIQUE + статус-гейт до и после lock |
+| CLOSE (TP/SL/LIQ) | `tp_sl:{pos}:{ts}:{reason}` | UNIQUE + статус-гейт |
+| Finalize close | `competition_end:{comp}:{pos}` | UNIQUE + `FOR UPDATE` на competitions |
+| Ledger open | `{key}:ledger` | UNIQUE account_ledger |
+| Ledger close | `{key}:ledger` | UNIQUE |
+| Gap ADJUSTMENT | `{key}:gap` | UNIQUE |
+| Cup reset | `reset:{acc}:{comp}` | UNIQUE |
 
-- `bot/emojis.py` — все ID из ТЗ, `tg_emoji(id, fallback)` → `<tg-emoji emoji-id="...">...</tg-emoji>`
-- **LONG `5449683594425410231` / SHORT `5447183459602669338`** — обязательно в `side_keyboard` и сообщениях
-- Inline кнопки — `InlineKeyboardButton(text, callback_data/url, icon_custom_emoji_id="...")` (не `🚀` в `text`)
-- Reply кнопки — `KeyboardButton(text, request_contact, icon_custom_emoji_id="...")` (`main_menu`, `contact_keyboard`)
-- Сообщения — HTML `TG_LONG/TG_SHORT/TG_WARNING/...` (`ParseMode.HTML`, `DefaultBotProperties` в `bot/main.py:37`), `F.text == "Личный кабинет"` (plain, без эмодзи в `text`)
+**Гарантия:** один ключ → максимум одна финансовая операция, атомарно (ledger+account+order+position в одном savepoint). Повтор → тот же результат без повторной мутации.
 
----
-
-## 13. Тесты
-
-- `pytest.ini: asyncio_mode = auto`
-- `tests/conftest.py` — `sqlite_engine` (`:memory:`) + `pg_engine` (`TEST_DATABASE_URL`→testcontainers `postgres:15-alpine`, `drop_all/create_all`), `clear_local_market_cache`
-- `test_paper_mvp.py` — bid/ask, close retry idempotency, expired competition, validate
-- `test_paper_money.py` — leverage `budget*leverage` margin (`500→5x→2500 notional, margin 500`), insufficient, invalid leverage, idempotent grant
-- `test_shared_market.py` — shared snapshot source of truth vs local cache, stale/future, finalize skip closed
-- `test_demo_acceptance.py` — LONG ASK / SHORT BID, prizes, noop finalize
-- `test_paper_race_pg.py` — PG race same key→1 position, one close, one snapshot (skip без Docker)
-- `test_product_acceptance.py` — `main_menu` premium icons (`CHART_UP_ID`/`CROWN_ID`), `safe_trade_error` HTML (`WARNING_ID`), `normalize_ticker`, `bingx_chart_url`, `LONG/SHORT IDs`
-- `test_tp_sl_leverage_price.py` (10) — `format_side` enum, `fmt_price` low-price (`0.14→$0.140000`, `0.000008→$0.00000800`, `precision=5`), per-coin leverage (`BTC 300 OK` / `UB 300→Max leverage`), global cap 300, LONG/SHORT TP/SL триггер и `not trigger`, `UB` PnL видимость с `price_precision=5`
-- Итого `33 passed, 4 skipped` (PG без Docker)
-
----
-
-## 14. Деплой
-
-- **Railway** (`railway.json` нет, используется `Procfile`+`nixpacks.toml`): `alembic upgrade head && python -m bot.main` (`Railpack` читает `Procfile`, builder `RAILPACK`)
-- `nixpacks.toml` — `python311`, `pip install -r requirements.txt`, `start: alembic upgrade head && python -m bot.main`
-- `Procfile` — `web: PYTHONPATH=/app alembic upgrade head && PYTHONPATH=/app python -m bot.main`
-- `alembic/env.py` — `DATABASE_URL` → `postgresql+asyncpg`, `target_metadata = Base.metadata`
-- `requirements.txt` — `aiogram, SQLAlchemy, asyncpg, aiosqlite, alembic, ccxt 4.3.89, pydantic, httpx` (без `fastapi/uvicorn/APScheduler`)
-- `runtime.txt` — `python-3.11.11`
-- Env прод: `BOT_TOKEN=861...`, `DATABASE_URL=postgresql://postgres:...@postgres.railway.internal:5432/railway` (+ `test_railway` для PG-тестов), `MARKET_DATA_MAX_AGE_MS=3000`, `ADMIN_TELEGRAM_IDS`
-- Деплой: `railway up --detach -m "..."` → `railway deployment list` → `SUCCESS`, `railway logs` → `Single-process bot starting...`, `Instruments sync complete`, `Run polling for bot @crypto_demo_vbot`
-- SSH: `railway ssh --service Postgres -- psql` → `market_snapshots 951`, `BTC/ETH/SOL age 2-4с`; `railway ssh --service CRYPTO_BOT -- python3 /tmp/check.py` → handler checks
-
----
-
-## 15. Операции и админка
-
-- `admin_stats` — `Users`/`Paper positions`
-- `admin_ban/unban <telegram_id> [причина]`
-- `admin_active_competition` — `Competition` info
-- `admin_create_demo_cup` / `admin_seed_demo_players` — `DEMO_SEED_ENABLED`
-- `admin_reconcile` — `build_leaderboard`
-- `admin_finish_competition` — ручной `finalize_competition_session` + `notify`
-- `admin_product_stats` — `metrics_snapshot` (`trade_opened/closed`, `bingx_error`, `tp/sl_triggered`)
-- `workers/lock.py` — advisory lock, `bot/main.py:40` ретрай `15×2с` на rolling deploy
+### 9.4 Гонки (проверено на реальном PG)
+| Гонка | Защита | Тест (PG, пройден) |
+|---|---|---|
+| Double OPEN (same key) | FOR UPDATE + UNIQUE + resolve | `test_pg_concurrent_open_same_key_single_effect` |
+| Double CLOSE (same key) | FOR UPDATE + статус-гейт + UNIQUE | `test_pg_concurrent_close_same_key_single_effect` |
+| Manual close vs TP/SL | account FOR UPDATE сериализует; статус-гейт после lock | `test_manual_close_race_has_one_close` |
+| Finalize vs trade/close | FOR UPDATE на competitions + savepoint | `test_two_finalizers_create_one_snapshot` |
+| Full cycle atomicity | reconciliation после open и close | `test_pg_open_close_ledger_account_atomic` |
 
 ---
 
-## 16. Известные фиксы (аудит)
+## 10. MARKET DATA
 
-- `006_widen_symbols` — `VARCHAR(20)→40` для `NCSINASDAQ1002USDUSDT` (22), `price_poller` batch commit вместо per-symbol (951 commit→4с lag)
-- `007_instrument_max_leverage` — per-coin (BTC/ETH 300)
-- `profile.py:258` — `callback.message.from_user` → `callback.from_user.id` (`_send_profile/_send_transactions` helper) — фікс «Мои сделки» не срабатывает
-- `profile.py:9` — добавлены `User/TradingAccount` импорты (`NameError TG_MONEY`)
-- `bot/main.py:46` — `db_middleware` `try/rollback`, `lock` retry
-- `services/competition.py:45` / `tp_sl_engine:74` / `competition_lifecycle:72` — `begin_nested()` savepoint вместо `rollback()` всего батча
-- `bot/views.py:46` — `get_display_snapshot` использует `settings.market_data_max_age_ms` (не хардкод 2000)
-- `bot/handlers/trade.py:49` — `LEVERAGES` `1..300` в 2 ряда, `format_side`/`fmt_price` для `PositionSide.LONG` и `$0.14→$0.140000`
-
----
-
-## 17. Что дальше (не в scope)
-
-- WebSocket вместо REST `fetch_tickers`
-- Лимитные/стоп-ордера
-- Вывод призов (ручной), P2P переводы
-- Более сильный антифрод (`device fingerprint`)
+```
+BingX (ccxt.fetch_tickers, swap, только DEMO_WATCHLIST 25 пар + открытые позиции)
+  → PriceSnapshot (bid/ask/last, exchange_timestamp)
+  → validate: bid>0, ask>=bid, finite, timestamp не из будущего (>5с)
+  → market_snapshots (PostgreSQL, UPSERT, батч-commit)
+       ↓
+get_execution_snapshot(session, symbol, max_age=6000мс)
+  → stale/unavailable → PaperError → «Рынок временно недоступен»
+```
+- **Локальный кэш** — только fallback на SQLite (тесты). На PG исполнение всегда из БД.
+- Retry: 3 попытки с backoff 0.5/1/2с; `ALERT` после 5 подряд неудач.
+- instruments sync при старте: цена/кол-во precision, min_quantity из BingX; max_leverage только вверх.
 
 ---
 
-## 18. Улучшения P0-P2 — аудит 2026-08-28 (после A-Z)
+## 11. TELEGRAM-ИНТЕРФЕЙС
 
-### P0.1 Ликвидация (критично)
-- **Проблема:** без стоп-лосса `unrealized` может уйти на `-notional` (LONG до 0, SHORT неограниченно), `return_amount = margin + net` уходит в минус → `CHECK balance_after>=0` → `DBAPIError` вместо бизнес-ошибки. На 300x достаточно 0.3% против.
-- **Исправление:** `db/competition_models.py:19` `ExecutionReason.LIQUIDATION` + миграция `008`, `services/paper_adapter.py:489` cap `return_amount<0 → 0`, `net=-margin`, `workers/tp_sl_engine.py:60` проверка `unrealized <= -margin*0.9 → LIQUIDATION` (savepoint, `liquidation_triggered`), тест `tests/test_liquidation.py` 3/3 (300x crash→cap, engine trigger, not premature).
+### Команды (все с ignore_case, русские алиасы)
+| Команда | Описание |
+|---|---|
+| `/start` | регистрация, верификация номера, грант |
+| `/profile` `/профиль` | личный кабинет: юзернейм, баланс, счётчики, ROE, место |
+| `/sdelki` `/сделки` `/активные` | **активные** сделки (пагинация 5/стр) |
+| `/history` `/история` `/все_сделки` | закрытые сделки + статистика (win-rate, +/−, лучшая/худшая) |
+| `/trade` `/торговать` | меню торговли |
+| `/top` `/топ` `/лидеры` | топ-10 с пагинацией |
+| `/positions` `/позиции` | открытые позиции |
+| `/admin_*` (9) | только для `ADMIN_TELEGRAM_IDS` |
 
-### P0.2 PG-тесты (4 skipped → green)
-- **Было:** `TEST_DATABASE_URL`/`DATABASE_URL` без `+asyncpg` → `ModuleNotFoundError psycopg2`, плюс `drop_all` на проде.
-- **Исправление:** `tests/conftest.py:40` конвертация `postgresql://→postgresql+asyncpg://`, `railway.internal` → изолированная `test_railway` (создаётся через `postgres` maintenance DB, `CREATE DATABASE IF NOT EXISTS`), `railway ssh --service CRYPTO_BOT -- pytest tests/test_paper_race_pg.py` → `4 passed` (см. `ACCEPTANCE_EVIDENCE.md`).
+### Reply-меню (главное)
+`Торговать` · `Личный кабинет` | `Топ 10` · `Сделки` — все с premium-иконками.
 
-### P1.3 Цена 10с при 300x — сужение опроса
-- **Было:** `price_poller` опрашивал все 951 `fetch_tickers()` → цикл ~4с, `MARKET_DATA_MAX_AGE_MS=10000` (10с) — для 300x уже риск.
-- **Исправление:** `workers/price_poller.py:26` `DEMO_WATCHLIST` 25 топ-монет + `_get_relevant_symbols()` (watchlist + `SELECT DISTINCT symbol WHERE status=OPEN`), `fetch_tickers(ccxt_symbols)` только для них → цикл <1с, `config.py:12` `MARKET_DATA_MAX_AGE_MS=3000` (3с), Railway var `MARKET_DATA_MAX_AGE_MS=3000`.
+### Кнопки (inline) — цвет + premium-иконка
+Bot API 9.4 `style`: `danger` (красный) / `success` (зелёный) / `primary` (синий) **вместе с** `icon_custom_emoji_id`.
 
-### P1.4 `starting_equity` между турнирами
-- **Было:** `services/competition.py:74` `starting = comp.initial_balance` (10000) без сброса `TradingAccount` → при входе в новый кубок `account.equity` (например 12000) остаётся, `current_equity` сразу 12000 → ROI 20% на старте.
-- **Исправление:** `join_competition:74` — при `is_new_cup` (последний `CompetitionParticipant.competition_id != current`) сброс `TradingAccount` к `initial_balance` через `AccountLedger ADJUSTMENT` (`reset:{acc.id}:{comp.id}`), `starting=current=initial`, тест `tests/test_competition_isolation.py:10` `test_starting_equity_clean_sheet`.
+| Цвет | Кнопки |
+|---|---|
+| `danger` 🔴 | Закрыть {COIN} {SIDE}, Да закрыть, Отмена, Убрать TP/SL, SHORT |
+| `success` 🟢 | Обновить, Подтвердить сделку, LONG, Торговать, Только TP |
+| `primary` 🔵 | Посмотреть все сделки, Топ 10, Топ, Активные сделки, Установить TP/SL, Выбрать монету, Быстрое открытие, Мои сделки, плечи 1x–300x |
+| default | Назад, пагинация ◀ ▶, Пропустить |
 
-### P2.5 Несколько позиций на один актив
-- **Решение:** разрешено (как и было), `paper_positions` PK `id` (не `user+symbol`), `tp_sl_engine` per-position savepoint, `profile.py:212` показывает все (до 15), `trade.py:617` close per `position.id`. Тесты `test_competition_isolation.py:30` `test_multiple_positions_same_asset_allowed` (2 LONG BTC) и `test_multiple_positions_different_tp_sl` (только одна из 2 с TP 110/120 закрывается при 111).
+Helper: `btn(text, callback_data, icon=…, style=…)` в `bot/views.py`.
 
-### P2.6 `docs/ANTI_CHEAT_AUDIT.md`
-- Обновлён под leverage: строка `10` — ликвидация (`tp_sl_engine 90% margin`, `LIQUIDATION`, cap, `CHECK`), `6` — perpetual (все пары eligible, фильтр убран), `7` — `INITIAL_BALANCE` idempotent, `price_poller` 25 пар, `starting_equity` clean sheet, `format_side`/`fmt_price`.
+### Premium emoji (обязательные ID)
+- **LONG** `5449683594425410231` · **SHORT** `5447183459602669338`
+- Полный список — `bot/emojis.py`; в сообщениях — `<tg-emoji emoji-id="…">fallback</tg-emoji>`, в кнопках — `icon_custom_emoji_id`, обычные эмодзи в кнопках запрещены.
 
-*Файл сгенерирован из кода `main` на 2026-08-28. Все пути указаны как в репо `C:\TGOD\CryptoBot`.*
+### Поток сделки (мастер)
+```
+/trade → [1. Выбрать монету] тикер → график BingX (ссылка) + кнопка «Открыть сделку»
+       → [2. Быстрое открытие] тикер → бюджет (USD, маржа) → плечо (фильтр по max_leverage)
+       → LONG/SHORT → TP/SL (цена/проценты/одно/пропустить) → подтверждение (цена входа ASK/BID)
+       → trade:confirm → open_position (idempotent) → «ПОЗИЦИЯ ОТКРЫТА»
+```
+Состояние — `trade_state: dict[uid]`, очищается при навигации; `SkipHandler` не перехватывает команды/меню; `in_flight` + `tg:{callback.id}` против двойного клика.
+
+---
+
+## 12. SECURITY
+
+| Угроза | Защита |
+|---|---|
+| SQL injection | все запросы — SQLAlchemy ORM / bound `text(:param)`; f-string SQL = 0 |
+| XSS | `html.escape(username)` в profile/leaderboard; Telegram HTML-режим |
+| IDOR (close) | `position.account_id == account.id` до и после lock |
+| IDOR (edit TP/SL) | `_get_owned_open_position` = `WHERE id AND account_id`; серверный assert в `update_position_tp_sl` |
+| IDOR (reads) | все выборки `WHERE account_id == own account` |
+| Подмена цены/PnL/equity | клиент присылает только тикер/бюджет/плечо/TP-SL; всё остальное — сервер |
+| Мультиаккаунт по номеру | `phone_number UNIQUE` + `request_contact` (user_id совпадение) |
+| Спам | ThrottlingMiddleware 0.8с/0.3с + in_flight + advisory lock |
+| Ban bypass | `ensure_can_trade` на открытии; ban/phone в сервисном слое |
+| Секреты | BOT_TOKEN/DATABASE_URL не логируются; `.env` в gitignore; `/metrics` без PII |
+
+**Известные ограничения:** banned-юзер может закрыть/отредактировать позицию (но не открыть); `/health`/`/metrics` без rate-limit (ок для internal).
+
+---
+
+## 13. ТУРНИРЫ И ЛИДЕРБОРД
+
+- Турнир создаётся автоматически (`Weekly Trading Cup #1`, 7 дней, prize 500) либо админом (`DEMO TRADING CUP`, 24ч, prize 100).
+- `join_competition` — clean-sheet: закрыть открытые позиции прошлого кубка (idempotent `cup_reset:{acc}:{comp}`), сброс счёта до 10000 через `ADJUSTMENT`, `starting_equity=10000`.
+- `build_leaderboard` — 3 SQL-запроса (без N+1), read-only, сортировка ROI↓ → equity↓ → joined_at; `current_equity = cash + margin_used + unrealized`.
+- Финализация (`ends_at`): `FOR UPDATE` на competitions, per-competition savepoint, закрытие всех позиций (`competition_end:{comp}:{pos}`), снапшот (1 раз, `UNIQUE(comp,user)`), призы DEMO (1 раз, `UNIQUE(comp,rank)`), уведомления best-effort.
+- `/top` — live-таблица с медалями 🥇🥈🥉, пагинация по 10, «Твоё место», таймер до итогов; после финала — снапшот «ФИНАЛ».
+
+---
+
+## 14. ЛИКВИДАЦИЯ
+
+```
+Каждые 1с по каждой открытой позиции:
+  mark = BID(LONG) / ASK(SHORT) из свежего снапшота
+  unrealized = mark-PnL
+  margin = notional / leverage
+  если unrealized ≤ −margin×0.9 → форс-закрытие reason='LIQUIDATION'
+```
+- Буфер 10%: закрывается до того, как убыток превысит маржу.
+- Изоляция: даже при гэпе убыток юзера ограничен маржой (см. 7.5).
+- `ExecutionReason.LIQUIDATION` — отдельная иммутабельная запись.
+- Пример: 300x, notional 3000, margin 10 → ликвидация при движении 0.3% против.
+
+---
+
+## 15. ТЕСТЫ
+
+**Локально:** `61 passed, 7 skipped` (7 = PG-тесты: 4 legacy race + 3 Phase 1 concurrency).
+**На реальном PG** (`railway ssh` → `test_railway`, изолированная БД): **21+4 passed**.
+
+| Файл | Покрывает |
+|---|---|
+| test_phase1_fixes.py (18) | FIX #1 negative %, FIX #2 ADJUSTMENT+reconciliation, FIX #3 idempotency, FIX #4 IDOR |
+| test_phase1_concurrency_pg.py (3, pg) | конкурентные open/close same key, атомарность (реальный PG) |
+| test_paper_race_pg.py (4, pg) | same-key open, manual close race, finalize race, no-cache-fallback |
+| test_liquidation.py (3) | capped loss, engine LIQUIDATION, not premature |
+| test_tp_sl_leverage_price.py (10) | TP/SL триггеры, плечо per-coin, fmt_price, format_side |
+| test_competition_isolation.py (4) | clean-sheet, несколько позиций |
+| test_shared_market.py (8) | канонический снапшот, stale/future, finalize |
+| test_paper_money.py (4) | маржа/плечо, insufficient, грант idempotent |
+| test_paper_mvp.py (3) | ASK/BID, retry, expired |
+| test_demo_acceptance.py (2) | LONG ASK/SHORT BID, призы, noop |
+| test_leaderboard.py (3) | таблица, медали, финал |
+| test_product_acceptance.py (7) | меню, команды, формулы URL, premium ID |
+
+Запуск PG-тестов: `railway ssh --service CRYPTO_BOT -- "cd /app && pytest tests/test_phase1_concurrency_pg.py tests/test_paper_race_pg.py -v"`.
+
+---
+
+## 16. ДЕПЛОЙ
+
+- `Procfile`: `web: PYTHONPATH=/app alembic upgrade head && PYTHONPATH=/app python -m bot.main`
+- Railway Railpack, Python 3.11, 1 реплика, restart ON_FAILURE
+- `railway up --detach` — загрузка кода; `railway ssh` — доступ к контейнеру/БД
+- Миграции применяются при старте (single replica — без гонок); БД сейчас на `009 (head)`
+- Rolling deploy: advisory lock retry 15×2с — старый контейнер освобождает lock, новый стартует
+- Проверка: логи `Single-process bot starting…` → `Run polling` → `Instruments sync complete`; `/health` 200
+
+---
+
+## 17. АДМИН-КОМАНДЫ
+
+`/admin_stats` · `/admin_ban <id> <причина>` · `/admin_unban <id>` · `/admin_active_competition` · `/admin_create_demo_cup` · `/admin_seed_demo_players` · `/admin_reconcile` · `/admin_finish_competition` (ручная финализация) · `/admin_product_stats` (метрики) — все с `is_admin` + `DEMO_SEED_ENABLED` гейтингом для seed.
+
+---
+
+## 18. ИСТОРИЯ КРИТИЧЕСКИХ ФИКСОВ
+
+| Fix | Суть | Коммит |
+|---|---|---|
+| IDOR edit TP/SL | `WHERE id AND account_id` во всех 5 путях + серверный assert | Phase 1 |
+| ADJUSTMENT при гэпе | явный ledger при cap, без создания денег | Phase 1 |
+| Атомарность | ledger+account внутри savepoint (open+close) | Phase 1 |
+| Negative % | знак игнорируется, `val==0` reject | Phase 1 |
+| Leaderboard SQL | 3 запроса вместо 2N+1, read-only | audit v2 |
+| `Топ 10` hijack | SkipHandler + порядок роутеров | audit v2 |
+| tpsl:back перехват | `action=="back"` внутри cb_tp_sl | audit v2 |
+| Stale при close | MAX_AGE 6000мс + watchlist 25 пар | до Phase 1 |
+| Liquidation | 90% маржи + cap + ADJUSTMENT | P0 |
+| Perf | batch persist, пагинация 500, throttling | audit v2 |
+
+---
+
+## 19. ОГРАНИЧЕНИЯ И PHASE 2 (известные, не блокеры)
+
+- Tick-size: TP/SL квантуется к 8 знакам, не к `price_precision` инструмента (может не сработать на границе тика)
+- `is_percent` эвристика: `%` в тексте переключает режим даже в «точной цене»
+- `FOR UPDATE` только на `trading_accounts`; на `paper_positions` — статус-гейт (достаточно при same-account)
+- Leaderboard считает equity на лету — `Participant.current_equity` может отставать между сделками
+- WebSocket вместо REST-поллинга; лимитные ордера; выплаты призов — ручные
+
+---
+
+## 20. БЫСТРЫЙ СТАРТ
+
+```bash
+# локально
+pip install -r requirements.txt
+cp .env.example .env          # заполнить BOT_TOKEN, DATABASE_URL
+alembic upgrade head
+python -m bot.main
+pytest -q                     # 43 passed, 7 skipped
+
+# Railway
+railway up --detach -m "…"
+railway logs --service CRYPTO_BOT
+railway ssh --service CRYPTO_BOT -- "pytest tests/ -q"   # PG-тесты на test_railway
+```
+
+---
+
+*Документ сгенерирован из актуального кода `main` @ `925d36b`. Формулы верифицированы тестами на SQLite и реальном PostgreSQL.*
