@@ -105,7 +105,16 @@ async def pg_engine():
 
     try:
         raw_url = container.get_connection_url()
-        async_url = raw_url.replace("psycopg2://", "postgresql+asyncpg://").replace("postgresql://", "postgresql+asyncpg://")
+        # testcontainers returns e.g. 'postgresql+psycopg2://test:test@host:port/db'
+        # Replace the FULL scheme, not just the driver: partial replace of
+        # 'psycopg2://' inside 'postgresql+psycopg2://' produces
+        # 'postgresql+postgresql+asyncpg://' which SQLAlchemy can't parse.
+        if raw_url.startswith("postgresql+psycopg2://"):
+            async_url = raw_url.replace("postgresql+psycopg2://", "postgresql+asyncpg://", 1)
+        elif raw_url.startswith("postgresql://"):
+            async_url = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        else:
+            async_url = raw_url
         eng = create_async_engine(async_url, echo=False)
         async with eng.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
