@@ -102,7 +102,8 @@ async def cmd_start(message: Message, session):
     if user.phone_verified_at is None:
         await session.commit()
         await message.answer(
-            f"Привет! Это демо-тренажёр криптотрейдинга с реальными ценами BingX.\n\n"
+            f"Привет! Это <b>демо-тренажёр</b> криптотрейдинга с реальными ценами BingX.\n"
+            f"Все деньги виртуальные — это <b>не биржа</b>, риск потери реальных средств отсутствует.\n\n"
             f"Для старта подтвердите номер телефона — на него будет записан демо-баланс $10 000.",
             reply_markup=contact_keyboard(),
         )
