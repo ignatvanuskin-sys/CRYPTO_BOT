@@ -38,22 +38,21 @@ class ThrottlingMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event, data):
         self._prune_if_needed()
-        if isinstance(event, Message):
-            if event.from_user is None:
-                return await handler(event, data)
-            user_id = event.from_user.id
-            now = time.monotonic()
+        # Duck typing: Message has .text, CallbackQuery has .data — both have .from_user
+        if not hasattr(event, "from_user") or event.from_user is None:
+            return await handler(event, data)
+        user_id = event.from_user.id
+        is_message = hasattr(event, "text")  # Message has .text, CallbackQuery doesn't
+        now = time.monotonic()
+
+        if is_message:
             last = self._last_message[user_id]
             if now - last < self.message_rate:
-                if event.text and event.text.startswith("/"):
+                if getattr(event, "text", None) and event.text.startswith("/"):
                     await event.answer("Слишком часто. Подождите секунду.")
                 return None
             self._last_message[user_id] = now
-        elif isinstance(event, CallbackQuery):
-            if event.from_user is None:
-                return await handler(event, data)
-            user_id = event.from_user.id
-            now = time.monotonic()
+        else:
             last = self._last_callback[user_id]
             if now - last < self.callback_rate:
                 await event.answer("Слишком быстро", show_alert=False)
