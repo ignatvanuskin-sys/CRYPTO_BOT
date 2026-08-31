@@ -1387,17 +1387,12 @@ async def cb_edit_tp_sl(callback: CallbackQuery, session):
     current_sl = fmt_price(position.stop_loss) if position.stop_loss else "нет"
     # Separate TP/SL for both set and delete per user request
     kb_rows: list[list[InlineKeyboardButton]] = [
-        [btn("Поставить TP", f"edit_tp_sl:set:tp:{pos_id}", icon=STAR_ID, style="primary"), btn("Поставить SL", f"edit_tp_sl:set:sl:{pos_id}", icon=STAR_ID, style="primary")],
+        [btn("Поставить TP", f"edit_tp_sl:set:tp:{pos_id}", icon=STAR_ID, style="primary")],
+        [btn("Поставить SL", f"edit_tp_sl:set:sl:{pos_id}", icon=STAR_ID, style="primary")],
     ]
-    del_row: list[InlineKeyboardButton] = []
-    if position.take_profit is not None:
-        del_row.append(btn("Удалить TP", f"edit_tp_sl:clear:tp:{pos_id}", icon=TRASH_ID, style="danger"))
-    if position.stop_loss is not None:
-        del_row.append(btn("Удалить SL", f"edit_tp_sl:clear:sl:{pos_id}", icon=TRASH_ID, style="danger"))
-    if del_row:
-        kb_rows.append(del_row)
-    if not del_row:
-        kb_rows.append([btn("Убрать TP/SL", f"edit_tp_sl:clear:{pos_id}", icon=TRASH_ID, style="danger")])
+    # Deletion is always separate buttons — each removes only its own level
+    kb_rows.append([btn("Удалить TP", f"edit_tp_sl:clear:tp:{pos_id}", icon=TRASH_ID, style="danger")])
+    kb_rows.append([btn("Удалить SL", f"edit_tp_sl:clear:sl:{pos_id}", icon=TRASH_ID, style="danger")])
     kb_rows.append([btn("Назад", f"nav:transactions:0", icon=PIN_ID)])
     await callback.message.edit_text(
         f"{TG_STAR} <b>РЕДАКТОР TP/SL</b>\n\n"
@@ -1551,6 +1546,13 @@ async def cb_edit_tp_sl_clear(callback: CallbackQuery, session):
         return
     user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
     account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none() if user else None
+    # If the level being deleted is not set — friendly no-op
+    if clear_tp and not clear_sl and position.take_profit is None:
+        await callback.answer("TP не установлен", show_alert=True)
+        return
+    if clear_sl and not clear_tp and position.stop_loss is None:
+        await callback.answer("SL не установлен", show_alert=True)
+        return
     try:
         from services.paper_adapter import update_position_tp_sl
         new_tp = None if clear_tp else position.take_profit

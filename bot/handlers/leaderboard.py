@@ -173,6 +173,11 @@ async def cmd_top(message: Message, session):
     except Exception:
         pass
 
+    # Refresh the persistent keyboard so the old cached "Топ 10" is replaced
+    # by "Список лидеров" without the user having to send /start.
+    await message.answer("⬇️", reply_markup=main_menu())
+    await message.delete()
+
     title, lb, users_map, is_final, comp, total = await _get_leaderboard_for_display(session, offset=0)
 
     if comp is None:
