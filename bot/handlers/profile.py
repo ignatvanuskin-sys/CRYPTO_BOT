@@ -46,19 +46,16 @@ from bot.views import (
     main_menu,
     safe_edit,
 )
-from datetime import datetime, timezone
-
-from db.competition_models import Competition, CompetitionParticipant, CompetitionPrize, CompetitionStatus
 from db.models import User
 from db.paper_models import PaperPosition, PositionStatus, TradingAccount
 from services.accounts import get_or_create_user, verify_phone
-from services.competition import get_active_competition, get_or_create_default_competition, join_competition
-from services.leaderboard import get_user_rank
 from services.pnl import (
     cross_liquidation_buffer,
     cross_liquidation_buffer_pct,
     cross_liquidation_threshold,
 )
+from services.competition import get_or_create_default_competition, join_competition
+from services.leaderboard import get_user_rank
 from services.trading_account import get_or_create_trading_account
 
 # trade_state — очищаем при навигации вне торговли, чтобы не hijack-ить следующую команду
@@ -119,57 +116,14 @@ async def cmd_start(message: Message, session):
     await _grant_demo_balance(session, user)
     await _ensure_competition(session, user)
     await session.commit()
-    # Product landing per spec 3 — no technical jargon
-    account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
-    competition = await get_active_competition(session)
-    if competition is None:
-        competition = await get_or_create_default_competition(session)
-    # participants & prize
-    part_count = 0
-    prize_pool = competition.prize_pool if competition else 0
-    try:
-        from sqlalchemy import func
-
-        part_count = (await session.execute(select(func.count()).select_from(CompetitionParticipant).where(CompetitionParticipant.competition_id == competition.id))).scalar_one() if competition else 0
-        # prize pool already on competition, but also check prizes table sum
-        prize_rows = (await session.execute(select(CompetitionPrize).where(CompetitionPrize.competition_id == competition.id))).scalars().all()
-        if prize_rows:
-            prize_pool = sum([p.amount for p in prize_rows], start=Decimal("0"))
-    except Exception:
-        pass
-    # time left
-    time_left = "—"
-    if competition and competition.ends_at:
-        secs = max(0, int((competition.ends_at - datetime.now(timezone.utc)).total_seconds()))
-        h, rem = divmod(secs, 3600)
-        m, s = divmod(rem, 60)
-        time_left = f"{h:02d}:{m:02d}:{s:02d}"
-    # rank
-    rank_info = await get_user_rank(session, competition.id, user.id) if competition else None
-    rank_str = f"#{rank_info['rank']}" if rank_info else "—"
-    # balance
-    balance_str = fmt_money(account.equity) if account else fmt_money(Decimal("10000"))
-    # Build landing
-    landing = (
-        f"📈 <b>CRYPTO DEMO</b>\n\n"
-        f"Paper trading на реальных ценах BingX.\n\n"
-        f"💰 Демо-баланс\n{balance_str}\n\n"
-        f"🔥 Соревнование\n{competition.name if competition else 'Demo Trading Cup'}\n\n"
-        f"⏱ До конца\n{time_left}\n\n"
-        f"👥 Участников\n{part_count}\n\n"
-        f"🏆 Призовой фонд\n{fmt_money(prize_pool)}\n\n"
-        f"📊 Твоё место\n{rank_str}"
+    welcome = f"{TG_PARTY} Добро пожаловать!" if is_new else "С возвращением!"
+    await send_main_menu(
+        message,
+        f"{welcome}\n\n"
+        f"{TG_MONEY} Демо-баланс: $10 000\n\n"
+        f"{tg_emoji(CHART_UP_ID, '📈')} <b>Торговать</b> — открыть сделку\n"
+        f"{TG_CROWN} <b>Личный кабинет</b> — баланс, сделки, рейтинг",
     )
-    # Inline primary actions
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [btn("Торговать", "wiz:start", icon=CHART_UP_ID, style="success"), btn("Лидерборд", "nav:top", icon=GOLD_ID, style="primary")],
-            [btn("Мои позиции", "nav:transactions", icon=CHART_ID, style="primary"), btn("Профиль", "nav:profile", icon=CROWN_ID, style="primary")],
-        ]
-    )
-    await message.answer(landing, parse_mode=ParseMode.HTML, reply_markup=kb)
-    # Persistent reply keyboard
-    await message.answer("Меню:", reply_markup=main_menu())
 
 
 @router.message(F.contact)
@@ -239,7 +193,7 @@ async def cmd_transactions(message: Message, session):
 @router.message(Command("istoriya", ignore_case=True))
 @router.message(Command("все_сделки", ignore_case=True))
 @router.message(Command("vse_sdelki", ignore_case=True))
-@router.message(F.text.in_({"Посмотреть все сделки", "История", "📜 История", "История сделок"}))
+@router.message(F.text == "Посмотреть все сделки")
 async def cmd_history(message: Message, session):
     if message.from_user is None:
         return
@@ -288,24 +242,24 @@ async def _send_profile(telegram_id: int, session, target: Message | CallbackQue
     roe = fmt_pct(rank_info["roi"]) if rank_info else "+0.00%"
 
     safe_name = html.escape(str(user.username or user.telegram_id))[:32]
-    total_trades = len(positions)
     text = (
-        f"👤 <b>ПРОФИЛЬ</b>\n\n"
-        f"📌 Юзернейм: {safe_name}\n\n"
-        f"💰 Баланс\n{fmt_money(account.equity)}\n\n"
-        f"📈 PnL\n{fmt_money(account.total_pnl)}\n\n"
-        f"📊 ROI\n{roe}\n\n"
-        f"🏆 Лучший результат\n{rank}\n\n"
-        f"🔥 Сделок\n{total_trades}"
+        f"{TG_CROWN} <b>ЛИЧНЫЙ КАБИНЕТ</b>\n\n"
+        f"{tg_emoji(PIN_ID, '📌')} Юзернейм: {safe_name}\n"
+        f"{TG_MONEY} Баланс: {fmt_money(account.equity)}\n\n"
+        f"{TG_CHART} <b>СДЕЛКИ</b>\n"
+        f"Успешных: {wins}\n"
+        f"Неуспешных: {losses}\n\n"
+        f"{tg_emoji(CHART_UP_ID, '📈')} Общий ROE: {roe}\n"
+        f"{TG_STAR} Место в рейтинге: {rank}"
     )
     await chat_target.answer(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [btn("Мои позиции", "nav:transactions", icon=CHART_ID, style="primary")],
-                [btn("История", "nav:history:0", icon=BOOKMARK_ID, style="primary")],
-                [btn("Лидерборд", "nav:top", icon=GOLD_ID, style="primary")],
+                [btn("Сделки", "nav:transactions", icon=GREEN_ID, style="primary")],
+                [btn("Топ 10", "nav:top", icon=GOLD_ID, style="primary")],
+                [btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")],
             ]
         ),
     )
@@ -388,29 +342,28 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
     open_keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     page_num = offset // limit + 1
     total_pages = (total_active + limit - 1) // limit if total_active else 1
+    # Кросс-маржа: запас до ликвидации на уровне аккаунта (общий для всех позиций)
+    threshold = cross_liquidation_threshold(account.initial_balance)
     buffer = cross_liquidation_buffer(account.equity, account.initial_balance)
     buffer_pct = cross_liquidation_buffer_pct(account.equity, account.initial_balance)
-    header = f"📊 <b>МОИ ПОЗИЦИИ</b> · {total_active}  {page_num}/{total_pages}\n"
-    header += f"🛡 Запас до ликвидации\n{fmt_money(buffer)} · {buffer_pct}%\n"
+    header = f"{TG_CHART} <b>АКТИВНЫЕ СДЕЛКИ</b> {page_num}/{total_pages} — всего {total_active}\n"
+    header += f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%) | Порог equity {fmt_money(threshold)}\n"
     lines = [header]
     for p in positions:
         side_str = format_side(p.side)
-        side_icon = "🟢" if side_str == "LONG" else "🔻"
+        side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
+        pnl_line = f"PnL: {fmt_money(p.unrealized_pnl)}"
+        # Сумма входа = маржа = бюджет, который юзер реально выделил (notional/leverage)
         pos_margin = (p.notional / p.leverage) if p.leverage else p.notional
         pnl_pct = (p.unrealized_pnl / pos_margin * 100) if pos_margin else Decimal("0")
-        pnl_line = f"{'🟢' if p.unrealized_pnl > 0 else '🔴' if p.unrealized_pnl < 0 else '💰'} PnL\n{fmt_money(p.unrealized_pnl)} ({fmt_pct(pnl_pct)})"
-        tp_line = fmt_price(p.take_profit) if p.take_profit else "—"
-        sl_line = fmt_price(p.stop_loss) if p.stop_loss else "—"
+        pnl_pct_str = fmt_pct(pnl_pct)
+        status_line = f"{tg_emoji(GREEN_ID, '🟢')} ОТКРЫТА"
         lines.append(
-            f"{side_icon} <b>{p.symbol} {side_str} {fmt_leverage(p.leverage)}</b>\n\n"
-            f"Вход\n{fmt_price(p.entry_price)}\n\n"
-            f"Сейчас\n{fmt_price(p.current_price)}\n\n"
-            f"💰 Маржа\n{fmt_money(pos_margin)}\n\n"
-            f"📊 Позиция\n{fmt_money(p.notional)}\n\n"
-            f"{pnl_line}\n\n"
-            f"⭐ TP\n{tp_line}\n\n"
-            f"🛡 SL\n{sl_line}\n\n"
-            f"🟢 ОТКРЫТА"
+            f"{p.symbol} {side_tag} {side_str} {fmt_leverage(p.leverage)}\n"
+            f"Вход: {fmt_price(p.entry_price)} → Сейчас: {fmt_price(p.current_price)}\n"
+            f"Вход (маржа): {fmt_money(pos_margin)} | {pnl_line} ({pnl_pct_str})\n"
+            f"Объём с плечом: {fmt_money(p.notional)}\n"
+            f"{status_line}"
         )
     # Callback («Обновить»/навигация) — редактируем окно на месте, не создавая новое сообщение
     if is_callback:
@@ -463,11 +416,12 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
     if total_closed == 0:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [btn("Открыть первую сделку", "wiz:start", icon=CHART_UP_ID, style="success")],
+                [btn("Активные сделки", "nav:transactions:0", icon=CHART_ID, style="primary")],
+                [btn("Торговать", "nav:trade", icon=CHART_UP_ID, style="success")],
             ]
         )
         await chat_target.answer(
-            f"📜 <b>ИСТОРИЯ</b>\n\nУ тебя пока нет закрытых сделок.\n\n🚀 Открыть первую сделку",
+            f"{TG_CHART} <b>ИСТОРИЯ СДЕЛОК</b>\n\nЗакрытых сделок пока нет.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
         )
@@ -529,26 +483,23 @@ async def _send_history(telegram_id: int, session, target: Message | CallbackQue
 
     page_num = offset // limit + 1
     total_pages = (total_closed + limit - 1) // limit
-    # Spec 13: clean history
-    header = f"📜 <b>ИСТОРИЯ</b>  {page_num}/{total_pages}\n\n📈 Всего PnL\n{fmt_money(total_pnl)}\n"
+    header = (
+        f"{TG_CHART} <b>ИСТОРИЯ — ЗАКРЫТЫЕ СДЕЛКИ</b> {page_num}/{total_pages}\n"
+        f"Всего: {total_closed}  {tg_emoji(GREEN_ID, '🟢')} Успешных: {win_cnt} ({win_rate:.1f}%)  {tg_emoji(RED_ID, '🔴')} Неуспешных: {loss_cnt}\n"
+        f"{TG_MONEY} Общий PnL: {fmt_money(total_pnl)}  {tg_emoji(GREEN_ID, '🟢')} +{fmt_money(plus)}  {tg_emoji(RED_ID, '🔴')} {fmt_money(minus)}\n"
+        f"Лучшая: {fmt_money(best)}  Худшая: {fmt_money(worst)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
     lines = [header]
     for p in positions:
         side_str = format_side(p.side)
+        side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         pnl = p.realized_pnl
-        side_icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "💰"
-        date_str = ""
-        if p.closed_at:
-            now = datetime.now(timezone.utc)
-            closed = p.closed_at
-            if closed.tzinfo is None:
-                closed = closed.replace(tzinfo=timezone.utc)
-            if closed.date() == now.date():
-                date_str = f"Сегодня · {closed.strftime('%H:%M')}"
-            else:
-                date_str = closed.strftime("%d.%m · %H:%M")
+        pnl_emoji = tg_emoji(GREEN_ID, "🟢") if pnl > 0 else tg_emoji(RED_ID, "🔴")
         lines.append(
-            f"{side_icon} <b>{p.symbol} {side_str}</b>\n"
-            f"PnL {fmt_money(pnl)}  {date_str}"
+            f"{p.symbol} {side_tag} {side_str} {fmt_leverage(p.leverage or 1)} {pnl_emoji} {fmt_money(pnl)}\n"
+            f"Вход: {fmt_price(p.entry_price)} → Выход: {fmt_price(p.current_price)}  {fmt_pct((pnl / (p.notional / (p.leverage or 1)) * 100) if p.notional else 0)}\n"
+            f"{p.closed_at.strftime('%d.%m %H:%M') if p.closed_at else ''}"
         )
     # Callback («Обновить»/пагинация) — редактируем окно на месте
     if is_callback:
@@ -600,149 +551,3 @@ async def nav_history(callback: CallbackQuery, session):
         except ValueError:
             offset = 0
     await _send_history(callback.from_user.id, session, callback, offset=offset)
-
-
-# ---- Competition screen per spec 15 ----
-@router.message(Command("competition", ignore_case=True))
-@router.message(Command("соревнование", ignore_case=True))
-@router.message(Command("sorevnovanie", ignore_case=True))
-@router.message(F.text.in_({"Соревнование", "🔥 Соревнование", "Соревнование 🔥"}))
-async def cmd_competition(message: Message, session):
-    if message.from_user is None:
-        return
-    _trade_state.pop(message.from_user.id, None)
-    await _send_competition(message.from_user.id, session, message)
-
-
-@router.callback_query(F.data == "nav:competition")
-async def nav_competition(callback: CallbackQuery, session):
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    _trade_state.pop(callback.from_user.id, None)
-    await _send_competition(callback.from_user.id, session, callback)
-
-
-async def _send_competition(telegram_id: int, session, target: Message | CallbackQuery):
-    is_callback = isinstance(target, CallbackQuery)
-    chat_target = target.message if is_callback else target
-    if chat_target is None:
-        if is_callback:
-            await target.answer()
-        return
-    user = await _get_user_by_telegram_id(session, telegram_id)
-    if not user:
-        await chat_target.answer("Сначала отправьте /start")
-        if is_callback:
-            await target.answer()
-        return
-    competition = await get_active_competition(session)
-    if competition is None:
-        competition = await get_or_create_default_competition(session)
-    account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
-    equity = account.equity if account else Decimal("10000")
-    # participants & prize
-    from sqlalchemy import func
-
-    part_count = (await session.execute(select(func.count()).select_from(CompetitionParticipant).where(CompetitionParticipant.competition_id == competition.id))).scalar_one() if competition else 0
-    prize_pool = competition.prize_pool if competition else Decimal("100")
-    try:
-        prize_rows = (await session.execute(select(CompetitionPrize).where(CompetitionPrize.competition_id == competition.id))).scalars().all()
-        if prize_rows:
-            prize_pool = sum([p.amount for p in prize_rows], start=Decimal("0"))
-    except Exception:
-        pass
-    rank_info = await get_user_rank(session, competition.id, user.id) if competition else None
-    rank_str = f"#{rank_info['rank']}" if rank_info else "—"
-    roi_str = fmt_pct(rank_info["roi"]) if rank_info else "+0.00%"
-    pnl_str = fmt_money(account.total_pnl) if account else fmt_money(Decimal("0"))
-    secs = max(0, int((competition.ends_at - datetime.now(timezone.utc)).total_seconds())) if competition and competition.ends_at else 0
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    time_left = f"{h:02d}:{m:02d}:{s:02d}"
-    text = (
-        f"🔥 <b>{competition.name.upper() if competition else 'DEMO TRADING CUP'}</b>\n\n"
-        f"⏱ До конца\n{time_left}\n\n"
-        f"👥 Участников\n{part_count}\n\n"
-        f"🏆 Призовой фонд\n{fmt_money(prize_pool)}\n\n"
-        f"📊 Твой результат\n{pnl_str} · {roi_str}\n\n"
-        f"🏅 Твоя позиция\n{rank_str}"
-    )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [btn("Торговать", "wiz:start", icon=CHART_UP_ID, style="success"), btn("Лидерборд", "nav:top", icon=GOLD_ID, style="primary")],
-            [btn("Пригласить друзей", "nav:invite", icon=PARTY_ID)],
-            [btn("Назад", "nav:home", icon=PIN_ID)],
-        ]
-    )
-    if is_callback:
-        await safe_edit(chat_target, text, markup=kb, parse_mode=ParseMode.HTML)
-        await target.answer()
-    else:
-        await chat_target.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-
-# ---- Help screen per spec 17 ----
-@router.message(Command("help", ignore_case=True))
-@router.message(Command("помощь", ignore_case=True))
-@router.message(F.text.in_({"Помощь", "ℹ️ Помощь", "Help"}))
-async def cmd_help(message: Message, session):
-    if message.from_user is None:
-        return
-    _trade_state.pop(message.from_user.id, None)
-    await _send_help(message.from_user.id, session, message)
-
-
-@router.callback_query(F.data == "nav:help")
-async def nav_help(callback: CallbackQuery, session):
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    _trade_state.pop(callback.from_user.id, None)
-    await _send_help(callback.from_user.id, session, callback)
-
-
-async def _send_help(telegram_id: int, session, target: Message | CallbackQuery):
-    is_callback = isinstance(target, CallbackQuery)
-    chat_target = target.message if is_callback else target
-    if chat_target is None:
-        if is_callback:
-            await target.answer()
-        return
-    text = (
-        f"ℹ️ <b>КАК ЭТО РАБОТАЕТ</b>\n\n"
-        f"1. Выбираешь монету\n"
-        f"2. Выбираешь LONG или SHORT\n"
-        f"3. Указываешь маржу\n"
-        f"4. При желании ставишь TP/SL\n"
-        f"5. Открываешь сделку\n"
-        f"6. Следишь за PnL\n"
-        f"7. Закрываешь позицию\n\n"
-        f"🟢 <b>LONG</b>\nЗаработок при росте цены.\n\n"
-        f"🔴 <b>SHORT</b>\nЗаработок при падении цены.\n\n"
-        f"⭐ <b>TP</b>\nАвтоматически фиксирует прибыль при достижении цели.\n\n"
-        f"🛡 <b>SL</b>\nАвтоматически закрывает позицию, чтобы ограничить убыток."
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[btn("Назад", "nav:home", icon=PIN_ID)]])
-    if is_callback:
-        await safe_edit(chat_target, text, markup=kb, parse_mode=ParseMode.HTML)
-        await target.answer()
-    else:
-        await chat_target.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-
-@router.callback_query(F.data == "nav:profile")
-async def nav_profile(callback: CallbackQuery, session):
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    _trade_state.pop(callback.from_user.id, None)
-    await _send_profile(callback.from_user.id, session, callback)
-
-
-@router.callback_query(F.data == "nav:invite")
-async def nav_invite(callback: CallbackQuery, session):
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    await callback.answer("Скоро: приглашения друзей", show_alert=True)

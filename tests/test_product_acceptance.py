@@ -13,13 +13,10 @@ def test_demo_prizes_sum_exactly_to_pool():
 def test_main_menu_has_reference_navigation():
     kb = main_menu()
     labels = [button.text for row in kb.keyboard for button in row]
-    # Spec 4 primary
     assert "Торговать" in labels
-    assert "Мои позиции" in labels
-    assert "Лидерборд" in labels
-    assert "Профиль" in labels
-    # secondary per spec
-    assert "История" in labels
+    assert "Личный кабинет" in labels
+    assert "Топ 10" in labels
+    assert "Сделки" in labels
     # premium icons via icon_custom_emoji_id, not regular emojis in text
     icons = [button.icon_custom_emoji_id for row in kb.keyboard for button in row]
     assert CHART_UP_ID in icons

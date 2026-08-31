@@ -36,7 +36,7 @@ from services.pnl import (
     cross_liquidation_buffer_pct,
     cross_liquidation_threshold,
 )
-from db.competition_models import Competition, CompetitionPrize, CompetitionStatus, LeaderboardSnapshot
+from db.competition_models import Competition, CompetitionStatus, LeaderboardSnapshot
 from db.models import User
 from services.competition import get_active_competition
 from services.leaderboard import build_leaderboard, get_top_n, get_user_rank
@@ -63,15 +63,17 @@ def _medal(rank: int) -> str:
     return f"{rank}."
 
 
-def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dict[int, User], is_final: bool, offset: int = 0, prizes: list = None) -> str:
-    """Spec 14: product leaderboard with prizes."""
+def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dict[int, User], is_final: bool, offset: int = 0) -> str:
+    """Красивая таблица топ-10 с пагинацией."""
     total = len(leaderboard)
+    # For display, slice by offset
     page = leaderboard[offset:offset+10]
-    header = f"🏆 <b>ЛИДЕРБОРД</b>\n\n🔥 {title}\n"
+    header = f"{TG_CROWN} <b>{title}</b>\n"
     if is_final:
         header += f"{TG_STAR} <i>Итоги недели — финальный топ-{10 if total>=10 else total}</i>\n"
     else:
         header += f"{TG_CHART} <i>Live топ — обновляется каждую сделку</i>\n"
+    header += f"Страница {offset//10+1}/{(total+9)//10} — всего {total}\n"
     header += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
     if not page:
@@ -86,28 +88,14 @@ def _format_leaderboard_text(title: str, leaderboard: list[dict], users_map: dic
         medal = _medal(rank)
         roi = fmt_pct(entry["roi"])
         equity = fmt_money(entry["equity"])
+        # Make top3 bold
         if rank <= 3:
             lines.append(f"{medal} <b>{name}</b>\n   {roi}  {equity}")
         else:
             lines.append(f"{medal} {name}\n   {roi}  {equity}")
 
     body = "\n\n".join(lines)
-    text = header + body
-    # Prize section per spec 14
-    if prizes:
-        text += "\n\n🏆 <b>ПРИЗЫ</b>\n"
-        for p in prizes:
-            if p.rank == 1:
-                text += f"🥇 ${p.amount:.2f}\n"
-            elif p.rank == 2:
-                text += f"🥈 ${p.amount:.2f}\n"
-            elif p.rank == 3:
-                text += f"🥉 ${p.amount:.2f}\n"
-            elif 4 <= p.rank <= 9:
-                text += f"{p.rank} · ${p.amount:.2f}\n"
-            elif p.rank == 10:
-                text += f"10 · ${p.amount:.2f}\n"
-    return text
+    return header + body
 
 
 async def _get_leaderboard_for_display(session, offset: int = 0):
@@ -174,9 +162,7 @@ async def _get_leaderboard_for_display(session, offset: int = 0):
 @router.message(Command("leaders", ignore_case=True))
 @router.message(Command("лидеры", ignore_case=True))
 @router.message(Command("таблица_лидеров", ignore_case=True))
-@router.message(Command("leaderboard_ru", ignore_case=True))
-@router.message(Command("лидерборд", ignore_case=True))
-@router.message(F.text.in_({"Топ", "Топ 10", "Лидеры", "Таблица лидеров", "🏆 Топ 10", "🏆 Топ", "Лидерборд", "🏆 Лидерборд", "Лидерборд"}))
+@router.message(F.text.in_({"Топ", "Топ 10", "Лидеры", "Таблица лидеров", "🏆 Топ 10", "🏆 Топ"}))
 async def cmd_top(message: Message, session):
     if message.from_user is None:
         return
@@ -197,8 +183,7 @@ async def cmd_top(message: Message, session):
         )
         return
 
-    prizes = (await session.execute(select(CompetitionPrize).where(CompetitionPrize.competition_id == comp.id).order_by(CompetitionPrize.rank))).scalars().all() if comp else []
-    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=0, prizes=prizes)
+    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=0)
     # Add user's own rank footer — lb is the FULL list, user is always findable
     user = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
     if user and not is_final:
@@ -208,15 +193,7 @@ async def cmd_top(message: Message, session):
         elif entry["rank"] <= 10:
             text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{entry['rank']}</b>  {fmt_pct(entry['roi'])}"
         else:
-            # Spec: До TOP-10 target
-            tenth = next((e for e in lb if e["rank"] == 10), None)
-            if tenth and entry:
-                need_roi = tenth["roi"] - entry["roi"]
-                need_equity = tenth["equity"] - entry["equity"]
-                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>  {fmt_pct(entry['roi'])}"
-                text += f"\n🎯 До TOP-10: {fmt_money(need_equity)} / {fmt_pct(need_roi)}"
-            else:
-                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>  {fmt_pct(entry['roi'])}"
+            text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>  {fmt_pct(entry['roi'])}"
     elif user and is_final:
         snap = (await session.execute(select(LeaderboardSnapshot).where(LeaderboardSnapshot.competition_id == comp.id, LeaderboardSnapshot.user_id == user.id))).scalar_one_or_none()
         if snap:
@@ -313,35 +290,33 @@ async def _build_open_positions(telegram_id: int, session):
         ])
         return (f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажмите «Торговать», чтобы открыть.", kb)
 
-    # Spec 11: simple buffer without threshold
+    # Кросс-маржа: общий запас до ликвидации на аккаунт
+    threshold = cross_liquidation_threshold(account.initial_balance)
     buffer = cross_liquidation_buffer(account.equity, account.initial_balance)
     buffer_pct = cross_liquidation_buffer_pct(account.equity, account.initial_balance)
     lines = [
-        f"📊 <b>МОИ ПОЗИЦИИ</b> · {len(positions)}\n",
-        f"🛡 Запас до ликвидации\n{fmt_money(buffer)} · {buffer_pct}%\n",
+        f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b> — {len(positions)}\n"
+        f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%) | Порог equity {fmt_money(threshold)}\n"
     ]
     kb_rows = []
     for p in positions:
         side_str = format_side(p.side)
-        # Spec 10: use 🔻 for SHORT, 🟢 for LONG
-        side_icon = "🟢" if side_str == "LONG" else "🔻"
+        side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         pnl = p.unrealized_pnl
+        pnl_str = fmt_money(pnl)
+        pnl_emoji = (
+            tg_emoji(GREEN_ID, "🟢") if pnl > 0
+            else tg_emoji(RED_ID, "🔴") if pnl < 0
+            else tg_emoji(MONEY_ID, "💵")
+        )
+        # Сумма входа (маржа) — главная цифра, объём с плечом — вторично
         pos_margin = (p.notional / p.leverage) if p.leverage else p.notional
         pnl_pct = (pnl / pos_margin * 100) if pos_margin else Decimal("0")
-        # PnL prominent
-        pnl_line = f"{'🟢' if pnl > 0 else '🔴' if pnl < 0 else '💰'} PnL\n{fmt_money(pnl)} ({fmt_pct(pnl_pct)})"
-        tp_line = fmt_price(p.take_profit) if p.take_profit else "—"
-        sl_line = fmt_price(p.stop_loss) if p.stop_loss else "—"
+        pnl_pct_str = fmt_pct(pnl_pct)
         lines.append(
-            f"{side_icon} <b>{p.symbol} {side_str} {fmt_leverage(p.leverage)}</b>\n\n"
-            f"Вход\n{fmt_price(p.entry_price)}\n\n"
-            f"Сейчас\n{fmt_price(p.current_price)}\n\n"
-            f"💰 Маржа\n{fmt_money(pos_margin)}\n\n"
-            f"📊 Позиция\n{fmt_money(p.notional)}\n\n"
-            f"{pnl_line}\n\n"
-            f"⭐ TP\n{tp_line}\n\n"
-            f"🛡 SL\n{sl_line}\n\n"
-            f"🟢 ОТКРЫТА"
+            f"{side_tag} <b>{p.symbol} {side_str} {fmt_leverage(p.leverage)} </b> {pnl_emoji} {pnl_str} ({pnl_pct_str})\n"
+            f"Вход {fmt_price(p.entry_price)} → Сейчас {fmt_price(p.current_price)}\n"
+            f"Вход (маржа): {fmt_money(pos_margin)} | Объём с плечом: {fmt_money(p.notional)}\n"
         )
         kb_rows.append([
             btn(f"Закрыть {p.symbol}", f"close_preview:{p.id}", icon=RED_ID, style="danger"),
@@ -382,8 +357,7 @@ async def nav_top(callback: CallbackQuery, session):
             )
         await callback.answer()
         return
-    prizes = (await session.execute(select(CompetitionPrize).where(CompetitionPrize.competition_id == comp.id).order_by(CompetitionPrize.rank))).scalars().all() if comp else []
-    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=offset, prizes=prizes)
+    text = _format_leaderboard_text(title, lb, users_map, is_final, offset=offset)
     # Add user rank footer — lb is the FULL list, no second build needed
     user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if user and comp:
@@ -400,14 +374,7 @@ async def nav_top(callback: CallbackQuery, session):
             elif entry["rank"] <= 10:
                 text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Ты в топ-10! <b>#{entry['rank']}</b>"
             else:
-                tenth = next((e for e in lb if e["rank"] == 10), None)
-                if tenth and entry:
-                    need_roi = tenth["roi"] - entry["roi"]
-                    need_equity = tenth["equity"] - entry["equity"]
-                    text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>"
-                    text += f"\n🎯 До TOP-10: {fmt_money(need_equity)} / {fmt_pct(need_roi)}"
-                else:
-                    text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>"
+                text += f"\n\n━━━━━━━━━━━━━━━━━━━━\n{TG_PIN} Твоё место: <b>#{entry['rank']}</b>"
 
     if comp and not is_final:
         secs = max(0, int((comp.ends_at - datetime.now(timezone.utc)).total_seconds()))

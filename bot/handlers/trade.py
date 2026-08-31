@@ -69,14 +69,12 @@ router = Router()
 trade_state: dict[int, dict] = {}
 
 LEVERAGES = ["1", "2", "5", "10", "20", "50", "100", "150", "300"]
-WIZ_LEVERAGES = ["5", "10", "20", "50", "100"]
 
 # С этого плеча показываем предупреждение о риске ликвидации
 HIGH_LEVERAGE_WARNING_AT = Decimal("50")
 
 # Быстрые кнопки бюджета — чтобы не набирать сумму руками
 BUDGET_PRESETS = [Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")]
-WIZ_MARGINS = [Decimal("100"), Decimal("250"), Decimal("500"), Decimal("1000")]
 
 TG_WARNING = tg_emoji(WARNING_ID, "⚠️")
 TG_CHECK = tg_emoji(CHECK_ID, "✔️")
@@ -115,78 +113,6 @@ def trade_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [btn("1. Выбрать монету", "trade:coin", icon=DIAMOND_ID, style="primary")],
             [btn("2. Быстрое открытие", "trade:quick", icon=BOOM_ID, style="primary")],
-        ]
-    )
-
-
-# ---- New polished wizard per spec (asset → direction → margin → leverage → TP/SL) ----
-WIZ_ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-
-def wiz_asset_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [btn("BTCUSDT", "wiz:asset:BTCUSDT", icon=DIAMOND_ID, style="primary")],
-            [btn("ETHUSDT", "wiz:asset:ETHUSDT", icon=DIAMOND_ID, style="primary")],
-            [btn("SOLUSDT", "wiz:asset:SOLUSDT", icon=DIAMOND_ID, style="primary")],
-            [btn("Назад", "nav:home", icon=PIN_ID)],
-        ]
-    )
-
-
-def wiz_direction_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                btn("LONG", f"wiz:dir:{symbol}:LONG", icon=LONG_EMOJI_ID, style="success"),
-                btn("SHORT", f"wiz:dir:{symbol}:SHORT", icon=SHORT_EMOJI_ID, style="danger"),
-            ],
-            [btn("Назад", "wiz:back:asset", icon=PIN_ID)],
-        ]
-    )
-
-
-def wiz_margin_keyboard(symbol: str, side: str, available: Decimal | None) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for preset in WIZ_MARGINS:
-        if available is not None and preset > available:
-            continue
-        row.append(btn(f"${preset:f}", f"wiz:margin:{symbol}:{side}:{preset:f}", icon=MONEY_ID, style="primary"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    if available is not None:
-        rows.append([btn(f"Максимум — {fmt_money(available)}", f"wiz:margin:{symbol}:{side}:max", icon=DIAMOND_ID, style="success")])
-    rows.append([btn("Назад", f"wiz:back:dir:{symbol}", icon=PIN_ID)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def wiz_leverage_keyboard(symbol: str, side: str, margin: str, max_leverage: int | None = None) -> InlineKeyboardMarkup:
-    allowed = WIZ_LEVERAGES
-    if max_leverage is not None:
-        try:
-            ml = int(max_leverage)
-            allowed = [lv for lv in WIZ_LEVERAGES if int(lv) <= ml]
-            if not allowed:
-                allowed = [WIZ_LEVERAGES[0]]
-        except Exception:
-            pass
-    row1 = [btn(f"×{lv}", f"wiz:lev:{symbol}:{side}:{margin}:{lv}", icon=GEAR_ID, style="primary") for lv in allowed]
-    rows = [row1[i : i + 3] for i in range(0, len(row1), 3)]
-    rows.append([btn("Назад", f"wiz:back:margin:{symbol}:{side}:{margin}", icon=PIN_ID)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def wiz_tpsl_mode_keyboard(symbol: str, side: str, margin: str, lev: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [btn("В процентах от маржи", f"wiz:tpsl:percent:{symbol}:{side}:{margin}:{lev}", icon=STAR_ID, style="primary")],
-            [btn("Точной ценой", f"wiz:tpsl:price:{symbol}:{side}:{margin}:{lev}", icon=MONEY_ID, style="primary")],
-            [btn("Без TP/SL", f"wiz:tpsl:skip:{symbol}:{side}:{margin}:{lev}", icon=FREE_ID)],
-            [btn("Назад", f"wiz:back:lev:{symbol}:{side}:{margin}:{lev}", icon=PIN_ID)],
         ]
     )
 
@@ -373,31 +299,13 @@ async def _show_leverage_step(target, session, user_id: int, symbol: str, budget
 async def cmd_trade(message: Message, session):
     if message.from_user is not None:
         trade_state.pop(message.from_user.id, None)
-    # New polished wizard entry per spec 5 STEP1
-    comp = await get_or_create_default_competition(session)
-    comp_line = f"🔥 {comp.name}\n" if comp else ""
     await message.answer(
-        f"📈 <b>ТОРГОВЛЯ</b>\n\nВыбери монету.\n\n{comp_line}💎 BTCUSDT · ETHUSDT · SOLUSDT",
+        f"{TG_CHART_UP} <b>ТОРГОВЛЯ</b>\n\n"
+        f"{tg_emoji(DIAMOND_ID, '💎')} Выбрать монету — график пары на BingX\n"
+        f"{tg_emoji(BOOM_ID, '💥')} Быстрое открытие — сделка за несколько шагов",
         parse_mode=ParseMode.HTML,
-        reply_markup=wiz_asset_keyboard(),
+        reply_markup=trade_menu_keyboard(),
     )
-
-
-@router.callback_query(F.data == "wiz:start")
-async def wiz_start(callback: CallbackQuery, session):
-    if callback.from_user is not None:
-        trade_state.pop(callback.from_user.id, None)
-    if callback.message is None:
-        await callback.answer()
-        return
-    comp = await get_or_create_default_competition(session)
-    comp_line = f"🔥 {comp.name}\n" if comp else ""
-    await callback.message.edit_text(
-        f"📈 <b>ТОРГОВЛЯ</b>\n\nВыбери монету.\n\n{comp_line}💎 BTCUSDT · ETHUSDT · SOLUSDT",
-        parse_mode=ParseMode.HTML,
-        reply_markup=wiz_asset_keyboard(),
-    )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "nav:trade")
@@ -409,378 +317,6 @@ async def nav_trade(callback: CallbackQuery, session):
         return
     await cmd_trade(callback.message, session)
     await callback.answer()
-
-
-# ---- New polished wizard handlers (spec 5-9) ----
-@router.callback_query(F.data.startswith("wiz:asset:"))
-async def wiz_asset(callback: CallbackQuery, session):
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    symbol = callback.data.split(":", 2)[2]
-    inst = await _validate_instrument(session, symbol)
-    if inst is None:
-        await callback.answer("Пара недоступна", show_alert=True)
-        return
-    trade_state[callback.from_user.id] = {"symbol": symbol, "awaiting": "wiz_direction"}
-    await callback.message.edit_text(
-        f"📈 <b>{symbol}</b>\n\nВыбери направление:\n\n"
-        f"🟢 <b>LONG</b> — заработок при росте\n"
-        f"🔴 <b>SHORT</b> — заработок при падении",
-        parse_mode=ParseMode.HTML,
-        reply_markup=wiz_direction_keyboard(symbol),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("wiz:dir:"))
-async def wiz_dir(callback: CallbackQuery, session):
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    try:
-        _, _, symbol, side = callback.data.split(":", 3)
-    except ValueError:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    if side not in ("LONG", "SHORT"):
-        await callback.answer("Некорректное направление", show_alert=True)
-        return
-    inst = await _validate_instrument(session, symbol)
-    if inst is None:
-        await callback.answer("Пара недоступна", show_alert=True)
-        return
-    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
-    if not user:
-        await callback.answer("Сначала /start", show_alert=True)
-        return
-    try:
-        ensure_can_trade(user)
-    except PermissionError as e:
-        await callback.answer(_strip_tags(str(e))[:200], show_alert=True)
-        return
-    account = await _get_account(session, user)
-    available = _available_margin(account)
-    trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "awaiting": "wiz_margin"}
-    await callback.message.edit_text(
-        f"💰 <b>МАРЖА</b>\n\nСколько используем в сделке?\n\n"
-        f"{symbol} · {side} · Доступно: {fmt_money(available) if available else '—'}\n\n"
-        f"Выбери сумму или введи свою:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=wiz_margin_keyboard(symbol, side, available),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("wiz:margin:"))
-async def wiz_margin(callback: CallbackQuery, session):
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    try:
-        _, _, symbol, side, raw = callback.data.split(":", 4)
-    except ValueError:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    inst = await _validate_instrument(session, symbol)
-    if inst is None:
-        await callback.answer("Пара недоступна", show_alert=True)
-        return
-    user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
-    account = await _get_account(session, user) if user else None
-    available = _available_margin(account)
-    if raw == "max":
-        if available is None:
-            await callback.answer("Свободной маржи нет", show_alert=True)
-            return
-        budget = available
-    else:
-        try:
-            budget = Decimal(raw)
-        except Exception:
-            await callback.answer("Некорректная сумма", show_alert=True)
-            return
-        if available is not None and budget > available:
-            await callback.answer("Недостаточно средств", show_alert=True)
-            return
-        if budget <= 0 or budget > Decimal("1000000"):
-            await callback.answer("Некорректная сумма", show_alert=True)
-            return
-    # go to leverage
-    max_lev = None
-    inst2 = await session.get(Instrument, symbol)
-    if inst2 and inst2.max_leverage:
-        max_lev = inst2.max_leverage
-    trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "budget": format(budget, "f"), "awaiting": "wiz_leverage"}
-    await callback.message.edit_text(
-        f"⚡ <b>ПЛЕЧО</b>\n\nВыбери плечо:\n\n{symbol} · {side} · Маржа: {fmt_money(budget)}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=wiz_leverage_keyboard(symbol, side, format(budget, "f"), max_lev),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("wiz:lev:"))
-async def wiz_lev(callback: CallbackQuery, session):
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    try:
-        _, _, symbol, side, margin, lev = callback.data.split(":", 5)
-    except ValueError:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    if lev not in LEVERAGES and lev not in WIZ_LEVERAGES:
-        await callback.answer("Некорректное плечо", show_alert=True)
-        return
-    # validate max leverage
-    inst = await session.get(Instrument, symbol)
-    if inst and inst.max_leverage and int(lev) > inst.max_leverage:
-        await callback.answer(f"Макс. плечо для {symbol} — x{inst.max_leverage}", show_alert=True)
-        return
-    trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "budget": margin, "leverage": lev, "awaiting": "wiz_tpsl"}
-    await callback.message.edit_text(
-        f"⭐ <b>TP / SL</b>\n\nКак задать уровни?\n\n"
-        f"🎯 В процентах от маржи\n"
-        f"💵 Точной ценой\n"
-        f"⏭ Без TP/SL",
-        parse_mode=ParseMode.HTML,
-        reply_markup=wiz_tpsl_mode_keyboard(symbol, side, margin, lev),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("wiz:tpsl:"))
-async def wiz_tpsl(callback: CallbackQuery, session):
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    parts = callback.data.split(":")
-    # wiz:tpsl:percent:SYM:SIDE:MARGIN:LEV  / wiz:tpsl:price:... / wiz:tpsl:skip:...
-    if len(parts) < 6:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    mode = parts[2]
-    symbol = parts[3]
-    side = parts[4]
-    margin = parts[5]
-    lev = parts[6] if len(parts) > 6 else "10"
-    if mode == "skip":
-        state = {"symbol": symbol, "side": side, "budget": margin, "leverage": lev, "tp": None, "sl": None}
-        trade_state[callback.from_user.id] = state
-        await _wiz_show_confirmation(callback.message, state, session, edit=True)  # type: ignore
-        await callback.answer()
-        return
-    if mode == "percent":
-        trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "budget": margin, "leverage": lev, "awaiting": "wiz_tpsl_percent"}
-        await callback.message.edit_text(
-            f"⭐ <b>TP / SL — % ОТ МАРЖИ</b>\n\n"
-            f"Укажи потенциальную прибыль и убыток в % от маржи.\n\n"
-            f"Например:\n<code>20 10</code> → TP +20% к марже, SL −10%\n"
-            f"Можно только TP: <code>20</code>\n\n"
-            f"100% = прибыль равна марже. Без минусов — система сама поставит знак.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [btn("Только TP", f"wiz:tpsl:onlytp:{symbol}:{side}:{margin}:{lev}", icon=STAR_ID)],
-                [btn("Только SL", f"wiz:tpsl:onlysl:{symbol}:{side}:{margin}:{lev}", icon=STAR_ID)],
-                [btn("Пропустить", f"wiz:tpsl:skip:{symbol}:{side}:{margin}:{lev}", icon=FREE_ID)],
-                [btn("Назад", f"wiz:back:tpsl:{symbol}:{side}:{margin}:{lev}", icon=PIN_ID)],
-            ]),
-        )
-        await callback.answer()
-        return
-    if mode == "price":
-        trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "budget": margin, "leverage": lev, "awaiting": "wiz_tpsl_price"}
-        await callback.message.edit_text(
-            f"💵 <b>TP / SL — ТОЧНОЙ ЦЕНОЙ</b>\n\n"
-            f"Укажи цену: <code>TP SL</code>\nНапример: <code>105000 99000</code>\n"
-            f"Можно одно: <code>105000</code> — только TP\n"
-            f"LONG: TP &gt; входа, SL &lt; входа; SHORT наоборот.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [btn("Пропустить", f"wiz:tpsl:skip:{symbol}:{side}:{margin}:{lev}", icon=FREE_ID)],
-                [btn("Назад", f"wiz:back:tpsl:{symbol}:{side}:{margin}:{lev}", icon=PIN_ID)],
-            ]),
-        )
-        await callback.answer()
-        return
-    if mode in ("onlytp", "onlysl"):
-        is_tp = mode == "onlytp"
-        trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "budget": margin, "leverage": lev, "awaiting": "wiz_tpsl_onlytp" if is_tp else "wiz_tpsl_onlysl"}
-        await callback.message.edit_text(
-            f"{'🎯' if is_tp else '🛡'} <b>Только {'TP' if is_tp else 'SL'} — %</b>\n\nВведи процент, например: <code>20</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [btn("Назад", f"wiz:back:tpsl:{symbol}:{side}:{margin}:{lev}", icon=PIN_ID)],
-            ]),
-        )
-        await callback.answer()
-        return
-
-
-@router.callback_query(F.data.startswith("wiz:back:"))
-async def wiz_back(callback: CallbackQuery, session):
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    parts = callback.data.split(":")
-    # wiz:back:asset / wiz:back:dir:SYM / wiz:back:margin:SYM:SIDE:MARGIN etc.
-    target = parts[2] if len(parts) > 2 else "asset"
-    if target == "asset":
-        comp = await get_or_create_default_competition(session)
-        comp_line = f"🔥 {comp.name}\n" if comp else ""
-        await callback.message.edit_text(
-            f"📈 <b>ТОРГОВЛЯ</b>\n\nВыбери монету.\n\n{comp_line}💎 BTCUSDT · ETHUSDT · SOLUSDT",
-            parse_mode=ParseMode.HTML,
-            reply_markup=wiz_asset_keyboard(),
-        )
-        trade_state[callback.from_user.id] = {"awaiting": "wiz_asset"}
-    elif target == "dir":
-        symbol = parts[3] if len(parts) > 3 else "BTCUSDT"
-        await callback.message.edit_text(
-            f"📈 <b>{symbol}</b>\n\nВыбери направление:\n\n🟢 LONG — рост\n🔴 SHORT — падение",
-            parse_mode=ParseMode.HTML,
-            reply_markup=wiz_direction_keyboard(symbol),
-        )
-        trade_state[callback.from_user.id] = {"symbol": symbol, "awaiting": "wiz_direction"}
-    elif target == "margin":
-        symbol = parts[3] if len(parts) > 3 else "BTCUSDT"
-        side = parts[4] if len(parts) > 4 else "LONG"
-        margin = parts[5] if len(parts) > 5 else "100"
-        user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
-        account = await _get_account(session, user) if user else None
-        available = _available_margin(account)
-        await callback.message.edit_text(
-            f"💰 <b>МАРЖА</b>\n\n{symbol} · {side} · Доступно: {fmt_money(available) if available else '—'}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=wiz_margin_keyboard(symbol, side, available),
-        )
-        trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "awaiting": "wiz_margin"}
-    elif target == "lev":
-        symbol = parts[3] if len(parts) > 3 else "BTCUSDT"
-        side = parts[4] if len(parts) > 4 else "LONG"
-        margin = parts[5] if len(parts) > 5 else "100"
-        lev = parts[6] if len(parts) > 6 else "10"
-        max_lev = None
-        inst = await session.get(Instrument, symbol)
-        if inst and inst.max_leverage:
-            max_lev = inst.max_leverage
-        await callback.message.edit_text(
-            f"⭐ <b>TP / SL</b>\n\nКак задать уровни?\n\n🎯 В процентах / 💵 Ценой / ⏭ Без",
-            parse_mode=ParseMode.HTML,
-            reply_markup=wiz_tpsl_mode_keyboard(symbol, side, margin, lev),
-        )
-        trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "budget": margin, "leverage": lev, "awaiting": "wiz_tpsl"}
-    elif target == "tpsl":
-        symbol = parts[3] if len(parts) > 3 else "BTCUSDT"
-        side = parts[4] if len(parts) > 4 else "LONG"
-        margin = parts[5] if len(parts) > 5 else "100"
-        lev = parts[6] if len(parts) > 6 else "10"
-        await callback.message.edit_text(
-            f"⭐ <b>TP / SL</b>\n\nКак задать уровни?\n\n🎯 В процентах / 💵 Ценой / ⏭ Без",
-            parse_mode=ParseMode.HTML,
-            reply_markup=wiz_tpsl_mode_keyboard(symbol, side, margin, lev),
-        )
-        trade_state[callback.from_user.id] = {"symbol": symbol, "side": side, "budget": margin, "leverage": lev, "awaiting": "wiz_tpsl"}
-    await callback.answer()
-
-
-@router.callback_query(F.data == "wiz:confirm")
-async def wiz_confirm(callback: CallbackQuery, session):
-    # Reuse same logic as trade:confirm but for wiz state
-    if callback.from_user is None or callback.message is None:
-        await callback.answer()
-        return
-    state = trade_state.get(callback.from_user.id, {})
-    if not state.get("symbol"):
-        await callback.answer("Сессия устарела", show_alert=True)
-        return
-    # copy to reuse cb_confirm logic
-    trade_state[callback.from_user.id]["in_flight"] = True
-    try:
-        user = (await session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
-        if not user:
-            await callback.answer("Сначала /start", show_alert=True)
-            return
-        ensure_can_trade(user)
-        account = await get_or_create_trading_account(session, user.id)
-        competition = await get_or_create_default_competition(session)
-        await join_competition(session, user.id, competition.id)
-        position = await open_position(
-            session, account, state["symbol"], state["side"], quantity=None,
-            take_profit=state.get("tp"), stop_loss=state.get("sl"),
-            idempotency_key=f"tg:{callback.id}", notional=Decimal(state["budget"])*Decimal(state["leverage"]),
-            competition_id=competition.id, requested_at=datetime.now(timezone.utc), leverage=Decimal(state["leverage"]),
-        )
-        await update_participant_equity(session, user.id, competition.id)
-        await session.commit()
-        trade_state.pop(callback.from_user.id, None)
-        # success card per spec 9
-        await callback.message.edit_text(
-            f"🟢 <b>СДЕЛКА ОТКРЫТА</b>\n\n"
-            f"{position.symbol} {format_side(position.side)} ×{position.leverage}\n\n"
-            f"Вход\n{fmt_price(position.entry_price)}\n\n"
-            f"Маржа\n{fmt_money(Decimal(position.notional)/Decimal(position.leverage))}\n\n"
-            f"Объём\n{fmt_money(position.notional)}\n\n"
-            f"⭐ TP\n{fmt_price(position.take_profit) if position.take_profit else '—'}\n\n"
-            f"🛡 SL\n{fmt_price(position.stop_loss) if position.stop_loss else '—'}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [btn("Мои позиции", "nav:transactions", icon=CHART_ID, style="primary")],
-                [btn("Новая сделка", "wiz:start", icon=CHART_UP_ID, style="success")],
-            ]),
-        )
-        await callback.answer("Сделка открыта")
-    except Exception as exc:
-        await session.rollback()
-        await callback.answer(_strip_tags(safe_trade_error(exc))[:200], show_alert=True)
-        if callback.message:
-            await callback.message.edit_text(safe_trade_error(exc), parse_mode=ParseMode.HTML, reply_markup=back_keyboard("nav:trade"))
-    finally:
-        st = trade_state.get(callback.from_user.id)
-        if st: st.pop("in_flight", None)
-
-
-async def _wiz_show_confirmation(target, state: dict, session, edit: bool = False):
-    # Compact confirmation per spec 8
-    symbol = state["symbol"]
-    budget = Decimal(state["budget"])
-    leverage = Decimal(state["leverage"])
-    side = state["side"]
-    tp = state.get("tp")
-    sl = state.get("sl")
-    snapshot = await get_display_snapshot(session, symbol)
-    entry_est = None
-    if snapshot:
-        entry_est = snapshot.ask if side == "LONG" else snapshot.bid
-    notional = (budget * leverage).quantize(Decimal("0.01"))
-    # calc TP/SL profit % for display
-    def _pct(price):
-        if price is None or entry_est is None: return None
-        try:
-            return ( (price - entry_est) / entry_est * leverage * 100 if side=="LONG" else (entry_est - price) / entry_est * leverage * 100 )
-        except: return None
-    tp_pct = _pct(tp)
-    sl_pct = _pct(sl)
-    tp_line = f"{fmt_price(tp)} ({fmt_pct(tp_pct)})" if tp else "—"
-    sl_line = f"{fmt_price(sl)} ({fmt_pct(sl_pct)})" if sl else "—"
-    text = (
-        f"🚀 <b>ПРОВЕРЬ СДЕЛКУ</b>\n\n"
-        f"💎 {symbol}\n"
-        f"{'🟢' if side=='LONG' else '🔴'} {side} ×{leverage}\n\n"
-        f"💰 Маржа\n{fmt_money(budget)}\n\n"
-        f"📊 Объём позиции\n{fmt_money(notional)}\n\n"
-        f"⭐ TP\n{tp_line}\n\n"
-        f"🛡 SL\n{sl_line}"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("ОТКРЫТЬ СДЕЛКУ", "wiz:confirm", icon=CHECK_ID, style="success")],
-        [btn("Назад", f"wiz:back:tpsl:{symbol}:{side}:{state['budget']}:{state['leverage']}", icon=PIN_ID)],
-    ])
-    if edit:
-        await safe_edit(target, text, kb, ParseMode.HTML)
-    else:
-        await target.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 @router.callback_query(F.data == "trade:coin")
@@ -821,184 +357,11 @@ async def handle_trade_text(message: Message, session):
     if message.text.startswith("/") or message.text in ("Личный кабинет", "Сделки", "Торговать", "Топ 10", "Позиции", "Топ"):
         trade_state.pop(message.from_user.id, None)
         raise SkipHandler
-    # Не перехватываем новую навигацию
-    if message.text in ("Мои позиции", "Лидерборд", "Профиль", "История", "Соревнование", "Помощь", "📊 Мои позиции", "🏆 Лидерборд", "👤 Профиль", "📜 История", "🔥 Соревнование", "ℹ️ Помощь"):
-        trade_state.pop(message.from_user.id, None)
-        raise SkipHandler
     state = trade_state.get(message.from_user.id)
     if not state or "awaiting" not in state:
         # Свободный текст вне мастера — не наш апдейт, пусть идут дальше по роутерам
         raise SkipHandler
     step = state["awaiting"]
-
-    # ---- New wizard custom inputs ----
-    if step == "wiz_margin":
-        raw = (message.text or "").strip().replace(",", ".")
-        if raw.lower() == "skip":
-            raise SkipHandler
-        try:
-            budget = Decimal(raw.replace("%", "").strip())
-        except Exception:
-            await message.answer(f"{TG_WARNING} Введи сумму, например: 500", parse_mode=ParseMode.HTML)
-            return
-        if not budget.is_finite() or budget <= 0:
-            await message.answer(f"{TG_WARNING} Введи сумму больше 0.", parse_mode=ParseMode.HTML)
-            return
-        symbol = state["symbol"]
-        side = state["side"]
-        user = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
-        account = await _get_account(session, user) if user else None
-        available = _available_margin(account)
-        if available is not None and budget > available:
-            await message.answer(f"{TG_WARNING} Недостаточно средств. Доступно: {fmt_money(available)}", parse_mode=ParseMode.HTML)
-            return
-        max_lev = None
-        inst = await session.get(Instrument, symbol)
-        if inst and inst.max_leverage:
-            max_lev = inst.max_leverage
-        trade_state[message.from_user.id] = {"symbol": symbol, "side": side, "budget": format(budget, "f"), "awaiting": "wiz_leverage"}
-        await message.answer(
-            f"⚡ <b>ПЛЕЧО</b>\n\nВыбери плечо:\n\n{symbol} · {side} · Маржа: {fmt_money(budget)}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=wiz_leverage_keyboard(symbol, side, format(budget, "f"), max_lev),
-        )
-        return
-    if step in ("wiz_tpsl_percent", "wiz_tpsl_price", "wiz_tpsl_onlytp", "wiz_tpsl_onlysl"):
-        text = (message.text or "").strip()
-        if text.lower() == "skip":
-            state["tp"] = None
-            state["sl"] = None
-            trade_state[message.from_user.id] = {**state, "awaiting": "wiz_confirm"}
-            await _wiz_show_confirmation(message, state, session)
-            return
-        # Reuse same parsing as legacy but with wiz keys
-        is_percent = step in ("wiz_tpsl_percent", "wiz_tpsl_onlytp", "wiz_tpsl_onlysl") or "%" in text
-        clean = text.replace("%", " ").replace(",", " ").strip()
-        parts = clean.split()
-        # Single TP/SL
-        if step in ("wiz_tpsl_onlytp", "wiz_tpsl_onlysl"):
-            if len(parts) != 1:
-                await message.answer(f"{TG_WARNING} Введи одно число.", parse_mode=ParseMode.HTML)
-                return
-            try:
-                val = Decimal(parts[0])
-                if not val.is_finite() or val == 0:
-                    raise InvalidOperation
-            except Exception:
-                await message.answer(f"{TG_WARNING} Введи число больше 0.", parse_mode=ParseMode.HTML)
-                return
-            if is_percent:
-                snap = await get_display_snapshot(session, state["symbol"])
-                entry_est = snap.ask if state["side"] == "LONG" else snap.bid if snap else None
-                if entry_est is None:
-                    await message.answer(f"{TG_WARNING} Цена недоступна, введи точной ценой.", parse_mode=ParseMode.HTML)
-                    return
-                lev = Decimal(state["leverage"])
-                pct = val.copy_abs()
-                if step == "wiz_tpsl_onlytp":
-                    if state["side"] == "LONG":
-                        tp = (entry_est * (Decimal("1") + pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                    else:
-                        tp = (entry_est * (Decimal("1") - pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                    state["tp"] = tp
-                    state["sl"] = None
-                else:
-                    if state["side"] == "LONG":
-                        sl = (entry_est * (Decimal("1") - pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                    else:
-                        sl = (entry_est * (Decimal("1") + pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                    state["tp"] = None
-                    state["sl"] = sl
-            else:
-                if val <= 0:
-                    await message.answer(f"{TG_WARNING} Цена должна быть >0.", parse_mode=ParseMode.HTML)
-                    return
-                if step == "wiz_tpsl_onlytp":
-                    state["tp"] = val
-                    state["sl"] = None
-                else:
-                    state["tp"] = None
-                    state["sl"] = val
-            trade_state[message.from_user.id] = state
-            await _wiz_show_confirmation(message, state, session)
-            return
-        # General percent/price with 1 or 2 numbers
-        if len(parts) not in (1, 2):
-            await message.answer(f"{TG_WARNING} Введи 1 или 2 числа, например: <code>20 10</code> или <code>105000 99000</code>", parse_mode=ParseMode.HTML)
-            return
-        if len(parts) == 1:
-            # single -> only TP
-            try:
-                v = Decimal(parts[0])
-                if not v.is_finite() or v == 0:
-                    raise InvalidOperation
-                if not is_percent and v <= 0:
-                    raise InvalidOperation
-            except Exception:
-                await message.answer(f"{TG_WARNING} Введи число больше 0.", parse_mode=ParseMode.HTML)
-                return
-            if is_percent:
-                snap = await get_display_snapshot(session, state["symbol"])
-                entry_est = snap.ask if state["side"] == "LONG" else snap.bid if snap else None
-                if entry_est is None:
-                    await message.answer(f"{TG_WARNING} Цена недоступна.", parse_mode=ParseMode.HTML)
-                    return
-                lev = Decimal(state["leverage"])
-                pct = v.copy_abs()
-                if state["side"] == "LONG":
-                    tp = (entry_est * (Decimal("1") + pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                else:
-                    tp = (entry_est * (Decimal("1") - pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                state["tp"] = tp
-                state["sl"] = None
-            else:
-                if v <= 0:
-                    await message.answer(f"{TG_WARNING} Цена должна быть >0.", parse_mode=ParseMode.HTML)
-                    return
-                state["tp"] = v
-                state["sl"] = None
-            trade_state[message.from_user.id] = state
-            await _wiz_show_confirmation(message, state, session)
-            return
-        # 2 numbers
-        try:
-            v1, v2 = Decimal(parts[0]), Decimal(parts[1])
-            if not v1.is_finite() or not v2.is_finite():
-                raise InvalidOperation
-            if not is_percent and (v1 <= 0 or v2 <= 0):
-                raise InvalidOperation
-        except Exception:
-            await message.answer(f"{TG_WARNING} Введи числа корректно.", parse_mode=ParseMode.HTML)
-            return
-        if is_percent:
-            snap = await get_display_snapshot(session, state["symbol"])
-            entry_est = snap.ask if state["side"] == "LONG" else snap.bid if snap else None
-            if entry_est is None:
-                await message.answer(f"{TG_WARNING} Цена недоступна.", parse_mode=ParseMode.HTML)
-                return
-            lev = Decimal(state["leverage"])
-            tp_pct = v1.copy_abs()
-            sl_pct = v2.copy_abs()
-            if tp_pct == 0 or sl_pct == 0:
-                await message.answer(f"{TG_WARNING} Процент должен быть >0.", parse_mode=ParseMode.HTML)
-                return
-            if state["side"] == "LONG":
-                tp = (entry_est * (Decimal("1") + tp_pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                sl = (entry_est * (Decimal("1") - sl_pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-            else:
-                tp = (entry_est * (Decimal("1") - tp_pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-                sl = (entry_est * (Decimal("1") + sl_pct/(Decimal("100")*lev))).quantize(Decimal("0.00000001"))
-            state["tp"] = tp
-            state["sl"] = sl
-        else:
-            if v1 <= 0 or v2 <= 0:
-                await message.answer(f"{TG_WARNING} Цены должны быть >0.", parse_mode=ParseMode.HTML)
-                return
-            state["tp"] = v1
-            state["sl"] = v2
-        trade_state[message.from_user.id] = state
-        await _wiz_show_confirmation(message, state, session)
-        return
 
     # --- Шаг: тикер ---
     if step in ("ticker_chart", "ticker_trade"):
@@ -1884,19 +1247,19 @@ async def cb_close_preview(callback: CallbackQuery, session):
         )
     else:
         pnl = None
-    # Spec 12: close preview
-    pos_margin = (position.notional / position.leverage) if position.leverage else position.notional
-    pnl_pct = (pnl / pos_margin * 100) if pnl is not None and pos_margin else None
+    side_tag = TG_LONG if position.side == "LONG" else TG_SHORT
     await callback.message.edit_text(
-        f"⚠️ <b>ЗАКРЫТЬ ПОЗИЦИЮ?</b>\n\n"
-        f"{position.symbol} {format_side(position.side)} {fmt_leverage(position.leverage)}\n\n"
-        f"Текущий PnL\n{fmt_money(pnl) if pnl is not None else '—'}{f' ({fmt_pct(pnl_pct)})' if pnl_pct is not None else ''}\n\n"
-        f"После закрытия результат будет зафиксирован.",
+        f"{TG_SIREN} <b>ЗАКРЫТИЕ ПОЗИЦИИ</b>\n\n"
+        f"{position.symbol} {side_tag} {format_side(position.side)} {fmt_leverage(position.leverage)}\n"
+        f"Вход: {fmt_price(position.entry_price)}\n"
+        f"Текущая цена: {fmt_price(current) if current else f'{TG_WARNING} рынок недоступен'}\n"
+        f"Ожидаемый PnL: {fmt_money(pnl) if pnl is not None else '—'}\n\n"
+        "LONG закроется по BID, SHORT — по ASK (серверная цена BingX).",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [btn("Закрыть позицию", f"close_confirm:{position.id}", icon=RED_ID, style="danger")],
-                [btn("Назад", "nav:transactions", icon=PIN_ID)],
+                [btn("Да, закрыть", f"close_confirm:{position.id}", icon=CHECK_ID, style="danger")],
+                [btn("Отмена", "nav:transactions", icon=CROSS_ID)],
             ]
         ),
     )
@@ -1932,20 +1295,17 @@ async def cb_close_confirm(callback: CallbackQuery, session):
         if closed.competition_id:
             await update_participant_equity(session, user.id, closed.competition_id)
         await session.commit()
-        # Spec 12: closed result with actual balance
-        await session.refresh(account)
-        pos_margin = (closed.notional / closed.leverage) if closed.leverage else closed.notional
-        pnl_pct = (pnl / pos_margin * 100) if pos_margin else Decimal("0")
+        side_tag = TG_LONG if closed.side == "LONG" else TG_SHORT
         await callback.message.edit_text(
-            f"🔴 <b>ПОЗИЦИЯ ЗАКРЫТА</b>\n\n"
-            f"{closed.symbol} {format_side(closed.side)} {fmt_leverage(closed.leverage)}\n\n"
-            f"PnL\n{fmt_money(pnl)} ({fmt_pct(pnl_pct)})\n\n"
-            f"Баланс\n{fmt_money(account.equity)}",
+            f"{TG_CHECK} <b>ПОЗИЦИЯ ЗАКРЫТА</b>\n\n"
+            f"{closed.symbol} {side_tag} {format_side(closed.side)} {fmt_leverage(closed.leverage)}\n"
+            f"Выход: {fmt_price(closed.current_price)}\n"
+            f"Реализованный PnL: {fmt_money(pnl)}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [btn("Мои позиции", "nav:transactions", icon=CHART_ID, style="primary")],
-                    [btn("Новая сделка", "wiz:start", icon=CHART_UP_ID, style="success")],
+                    [btn("Повторить сделку", f"retry:{closed.id}", icon=PLAY_ID, style="success")],
+                    [btn("Мои сделки", "nav:transactions", icon=CHART_ID, style="primary")],
                 ]
             ),
         )
