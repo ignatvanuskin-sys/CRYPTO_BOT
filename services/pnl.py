@@ -13,10 +13,28 @@ def calc_unrealized(side: str, entry: Decimal, current: Decimal, qty: Decimal) -
 def calc_notional(price: Decimal, qty: Decimal) -> Decimal:
     return (price * qty).quantize(Decimal("0.01"))
 
-# Ликвидация: полная потеря маржи (как на реальной бирже).
-# Позиция закрывается, когда убыток = 100% маржи.
-# Единственный источник правды и для tp_sl_engine, и для отображения в UI.
+# ── Изолированная маржа (legacy, оставлена для совместимости и тестов) ──
+# Позиция закрывалась, когда убыток = 100% её маржи.
+# Единственный источник для старых изолированных расчётов.
 LIQUIDATION_MARGIN_FRACTION = Decimal("1.0")
+
+# ── Кросс-маржа (актуальная модель, по ТЗ заказчика) ──
+# Формулировка: «ликвидация для всего бюджета — пока общий депозит не останется 0».
+# Все открытые позиции используют общий пул (весь баланс счёта).
+# Форс-закрытие ВСЕХ позиций когда equity исчерпано на 90% депозита.
+# Депозит = initial_balance — ФИКСИРОВАННЫЙ стартовый депозит турнира (обычно $10 000),
+#           НЕ текущий пик equity и НЕ cash+margin. Порог = initial × 0.10.
+#           Это сознательный выбор: пользователь, нарастивший баланс до $15 000,
+#           может потерять $14 000 прибыли до срабатывания защиты (до $1 000).
+#           Если бы порог считался от пика (trailing), успешные пользователи
+#           ликвидировались бы раньше. Заказчик формулировал «пока общий депозит
+#           не останется 0» — читается как исходный депозит, поэтому фиксируем
+#           именно такую семантику. Подтверждено перед показом.
+# Порог = 10% депозита остаётся, 90% съедено — есть запас на гэп между тиками движка
+# (движок тикает 1с). База расчёта — весь депозит, не одна позиция.
+# ACCOUNT_LIQUIDATION_REMAINING — сколько депозита должно остаться, остальное = буфер 90%.
+ACCOUNT_LIQUIDATION_REMAINING_FRACTION = Decimal("0.10")
+CROSS_LIQUIDATION_BUFFER_FRACTION = Decimal("0.90")
 
 
 def _safe_leverage(leverage: Decimal | int | None) -> Decimal | None:
@@ -101,3 +119,51 @@ def liquidation_move_pct(leverage: Decimal | int | None) -> Decimal | None:
     if lev is None:
         return None
     return (LIQUIDATION_MARGIN_FRACTION / lev * Decimal("100")).quantize(Decimal("0.01"))
+
+
+# ── Кросс-маржевые хелперы — единый источник и для движка, и для UI ──
+
+def cross_liquidation_threshold(initial_balance: Decimal | int | float | None) -> Decimal:
+    """Порог equity, ниже которого кросс-ликвидация (10% депозита остаётся).
+    initial_balance — ФИКСИРОВАННЫЙ стартовый депозит турнира (обычно $10 000),
+    не текущий пик equity. См. комментарий к ACCOUNT_LIQUIDATION_REMAINING_FRACTION.
+    """
+    try:
+        init = Decimal(str(initial_balance if initial_balance is not None else 0))
+    except (InvalidOperation, TypeError, ValueError):
+        init = Decimal("0")
+    if not init.is_finite() or init < 0:
+        init = Decimal("0")
+    return (init * ACCOUNT_LIQUIDATION_REMAINING_FRACTION).quantize(Decimal("0.01"))
+
+
+def is_account_liquidated(equity: Decimal | int | float | None, initial_balance: Decimal | int | float | None) -> bool:
+    """Кросс-критерий: equity <= 10% ФИКСИРОВАННОГО initial ⇒ все позиции закрываются.
+    initial — стартовый депозит, не пик. Даёт 90% буфер от исходного депозита.
+    """
+    try:
+        eq = Decimal(str(equity if equity is not None else 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return eq <= cross_liquidation_threshold(initial_balance)
+
+
+def cross_liquidation_buffer(equity: Decimal | int | float | None, initial_balance: Decimal | int | float | None) -> Decimal:
+    """Сколько $ осталось до кросс-ликвидации (equity - threshold). Может быть <0 если уже пробито."""
+    try:
+        eq = Decimal(str(equity if equity is not None else 0))
+    except (InvalidOperation, TypeError, ValueError):
+        eq = Decimal("0")
+    return (eq - cross_liquidation_threshold(initial_balance)).quantize(Decimal("0.01"))
+
+
+def cross_liquidation_buffer_pct(equity: Decimal | int | float | None, initial_balance: Decimal | int | float | None) -> Decimal:
+    """Запас до ликвидации в % депозита (buffer / initial *100). 100% = весь депозит цел, 0% = порог."""
+    try:
+        buf = cross_liquidation_buffer(equity, initial_balance)
+        init = Decimal(str(initial_balance if initial_balance is not None else 0))
+        if not init.is_finite() or init == 0:
+            return Decimal("0.00")
+        return (buf / init * Decimal("100")).quantize(Decimal("0.01"))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0.00")

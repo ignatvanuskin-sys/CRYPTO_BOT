@@ -131,7 +131,8 @@ async def test_single_close_keeps_detailed_card(sqlite_engine, users, fake_bots)
     sent = fake_bots[0].sent
     assert len(sent) == 1
     assert "ЛИКВИДАЦИЯ" in sent[0]["text"]
-    assert "Позиция закрыта принудительно: <b>$-98.00</b>" in sent[0]["text"]
+    assert "Позиция закрыта принудительно" in sent[0]["text"]
+    assert "<b>$-98.00</b>" in sent[0]["text"]
     assert "x300" in sent[0]["text"]
     rows = sent[0]["reply_markup"].inline_keyboard
     assert len(rows) == 1

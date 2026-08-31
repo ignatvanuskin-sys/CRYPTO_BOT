@@ -49,7 +49,11 @@ from bot.views import (
 from db.models import User
 from db.paper_models import PaperPosition, PositionStatus, TradingAccount
 from services.accounts import get_or_create_user, verify_phone
-from services.pnl import calc_liquidation_price, liquidation_move_pct
+from services.pnl import (
+    cross_liquidation_buffer,
+    cross_liquidation_buffer_pct,
+    cross_liquidation_threshold,
+)
 from services.competition import get_or_create_default_competition, join_competition
 from services.leaderboard import get_user_rank
 from services.trading_account import get_or_create_trading_account
@@ -336,30 +340,29 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
     kb_rows.append([btn("Обновить", f"nav:transactions:{offset}", icon=GREEN_ID, style="success")])
     kb_rows.append([btn("Посмотреть все сделки", "nav:history:0", icon=CHART_ID, style="primary")])
     open_keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    page_num = offset // limit + 1
+     page_num = offset // limit + 1
     total_pages = (total_active + limit - 1) // limit if total_active else 1
-    lines = [f"{TG_CHART} <b>АКТИВНЫЕ СДЕЛКИ</b> {page_num}/{total_pages} — всего {total_active}\n"]
+    # Кросс-маржа: запас до ликвидации на уровне аккаунта (общий для всех позиций)
+    threshold = cross_liquidation_threshold(account.initial_balance)
+    buffer = cross_liquidation_buffer(account.equity, account.initial_balance)
+    buffer_pct = cross_liquidation_buffer_pct(account.equity, account.initial_balance)
+    header = f"{TG_CHART} <b>АКТИВНЫЕ СДЕЛКИ</b> {page_num}/{total_pages} — всего {total_active}\n"
+    header += f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%) | Порог equity {fmt_money(threshold)}\n"
+    lines = [header]
     for p in positions:
         side_str = format_side(p.side)
         side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         pnl_line = f"PnL: {fmt_money(p.unrealized_pnl)}"
-        # PnL% относительно маржи (profit-based)
+        # Сумма входа = маржа = бюджет, который юзер реально выделил (notional/leverage)
         pos_margin = (p.notional / p.leverage) if p.leverage else p.notional
         pnl_pct = (p.unrealized_pnl / pos_margin * 100) if pos_margin else Decimal("0")
         pnl_pct_str = fmt_pct(pnl_pct)
         status_line = f"{tg_emoji(GREEN_ID, '🟢')} ОТКРЫТА"
-        liq = calc_liquidation_price(side_str, p.entry_price, p.leverage, p.quantity, p.notional)
-        liq_line = (
-            f"{tg_emoji(SIREN_ID, '🚨')} Ликвидация: {fmt_price(liq)}"
-            f" ({fmt_leverage_move_pct(liquidation_move_pct(p.leverage))})\n"
-            if liq is not None
-            else ""
-        )
         lines.append(
             f"{p.symbol} {side_tag} {side_str} {fmt_leverage(p.leverage)}\n"
             f"Вход: {fmt_price(p.entry_price)} → Сейчас: {fmt_price(p.current_price)}\n"
-            f"Объём: {fmt_money(p.notional)} | {pnl_line} ({pnl_pct_str})\n"
-            f"{liq_line}"
+            f"Вход (маржа): {fmt_money(pos_margin)} | {pnl_line} ({pnl_pct_str})\n"
+            f"Объём с плечом: {fmt_money(p.notional)}\n"
             f"{status_line}"
         )
     # Callback («Обновить»/навигация) — редактируем окно на месте, не создавая новое сообщение

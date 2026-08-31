@@ -31,7 +31,11 @@ from bot.emojis import (
     tg_emoji,
 )
 from bot.views import btn, fmt_leverage, fmt_leverage_move_pct, fmt_money, fmt_pct, main_menu
-from services.pnl import calc_liquidation_price, liquidation_move_pct
+from services.pnl import (
+    cross_liquidation_buffer,
+    cross_liquidation_buffer_pct,
+    cross_liquidation_threshold,
+)
 from db.competition_models import Competition, CompetitionStatus, LeaderboardSnapshot
 from db.models import User
 from services.competition import get_active_competition
@@ -286,7 +290,14 @@ async def _build_open_positions(telegram_id: int, session):
         ])
         return (f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>\n\nОткрытых позиций нет.\nНажмите «Торговать», чтобы открыть.", kb)
 
-    lines = [f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b> — {len(positions)}\n"]
+    # Кросс-маржа: общий запас до ликвидации на аккаунт
+    threshold = cross_liquidation_threshold(account.initial_balance)
+    buffer = cross_liquidation_buffer(account.equity, account.initial_balance)
+    buffer_pct = cross_liquidation_buffer_pct(account.equity, account.initial_balance)
+    lines = [
+        f"{TG_CHART} <b>ОТКРЫТЫЕ ПОЗИЦИИ</b> — {len(positions)}\n"
+        f"{tg_emoji(SIREN_ID, '🚨')} Запас до ликвидации: {fmt_money(buffer)} ({buffer_pct}%) | Порог equity {fmt_money(threshold)}\n"
+    ]
     kb_rows = []
     for p in positions:
         side_str = format_side(p.side)
@@ -298,22 +309,14 @@ async def _build_open_positions(telegram_id: int, session):
             else tg_emoji(RED_ID, "🔴") if pnl < 0
             else tg_emoji(MONEY_ID, "💵")
         )
-        liq = calc_liquidation_price(side_str, p.entry_price, p.leverage, p.quantity, p.notional)
-        liq_line = (
-            f"{tg_emoji(SIREN_ID, '🚨')} Ликвидация {fmt_price(liq)}"
-            f" ({fmt_leverage_move_pct(liquidation_move_pct(p.leverage))})\n"
-            if liq is not None
-            else ""
-        )
-        # PnL% относительно маржи (profit-based)
+        # Сумма входа (маржа) — главная цифра, объём с плечом — вторично
         pos_margin = (p.notional / p.leverage) if p.leverage else p.notional
         pnl_pct = (pnl / pos_margin * 100) if pos_margin else Decimal("0")
         pnl_pct_str = fmt_pct(pnl_pct)
         lines.append(
             f"{side_tag} <b>{p.symbol} {side_str} {fmt_leverage(p.leverage)} </b> {pnl_emoji} {pnl_str} ({pnl_pct_str})\n"
             f"Вход {fmt_price(p.entry_price)} → Сейчас {fmt_price(p.current_price)}\n"
-            f"Объём {fmt_money(p.notional)}\n"
-            f"{liq_line}"
+            f"Вход (маржа): {fmt_money(pos_margin)} | Объём с плечом: {fmt_money(p.notional)}\n"
         )
         kb_rows.append([
             btn(f"Закрыть {p.symbol}", f"close_preview:{p.id}", icon=RED_ID, style="danger"),

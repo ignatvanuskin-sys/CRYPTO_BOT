@@ -56,7 +56,13 @@ from db.paper_models import Instrument, PaperPosition, PositionStatus, TradingAc
 from services.accounts import ensure_can_trade
 from services.competition import get_or_create_default_competition, join_competition, update_participant_equity
 from services.paper_adapter import close_position, open_position
-from services.pnl import calc_liquidation_price, liquidation_move_pct
+from services.pnl import (
+    calc_liquidation_price,
+    cross_liquidation_buffer,
+    cross_liquidation_buffer_pct,
+    cross_liquidation_threshold,
+    liquidation_move_pct,
+)
 from services.trading_account import get_or_create_trading_account
 
 router = Router()
@@ -250,13 +256,13 @@ def budget_keyboard(symbol: str, available: Decimal | None) -> InlineKeyboardMar
 
 
 def _liquidation_lines(side: str, entry: Decimal | None, leverage: Decimal, quantity=None, notional=None) -> str:
-    """Строка с ценой ликвидации + предупреждение о высоком плече (A.1 / A.5)."""
+    """Legacy: изолированная цена (оставлена для справки в确认). См. кросс-буфер ниже."""
     move = liquidation_move_pct(leverage)
     move_txt = fmt_leverage_move_pct(move)
     lines = ""
     liq = calc_liquidation_price(side, entry, leverage, quantity, notional) if entry else None
     if liq is not None:
-        lines += f"{TG_SIREN} Ликвидация: {fmt_price(liq)} (движение {move_txt} против позиции)\n"
+        lines += f"{TG_SIREN} Ликвидация (изолиров., legacy): {fmt_price(liq)} (движение {move_txt} против позиции)\n"
     elif move is not None:
         lines += f"{TG_SIREN} Ликвидация: движение {move_txt} против позиции\n"
     if leverage >= HIGH_LEVERAGE_WARNING_AT and move is not None:
@@ -265,6 +271,19 @@ def _liquidation_lines(side: str, entry: Decimal | None, leverage: Decimal, quan
             "за секунды — позиция закроется, маржа сгорит полностью.\n"
         )
     return lines
+
+
+def _cross_buffer_line(account) -> str:
+    """Запас до кросс-ликвидации: $ и % депозита — главный индикатор теперь."""
+    if account is None:
+        return ""
+    try:
+        buf = cross_liquidation_buffer(account.equity, account.initial_balance)
+        pct = cross_liquidation_buffer_pct(account.equity, account.initial_balance)
+        thr = cross_liquidation_threshold(account.initial_balance)
+        return f"{TG_SIREN} Запас до ликвидации (кросс): {fmt_money(buf)} ({pct}%) | Порог equity {fmt_money(thr)}\n"
+    except Exception:
+        return ""
 
 
 async def _show_leverage_step(target, session, user_id: int, symbol: str, budget: Decimal, *, edit: bool) -> None:
@@ -715,15 +734,26 @@ async def _show_confirmation(message: Message, state: dict, session, edit: bool 
     state_line = (
         f"Цена входа ({side_word}): {fmt_price(entry)}\n" if entry else f"{TG_WARNING} Цена временно недоступна — исполнение по серверной цене BingX.\n"
     )
+    # Кросс-буфер: показываем запас до ликвидации (главный индикатор теперь), объём — вторично
+    account = None
+    try:
+        if message.from_user:
+            user_row = (await session.execute(select(User).where(User.telegram_id == message.from_user.id))).scalar_one_or_none()
+            if user_row:
+                account = (await session.execute(select(TradingAccount).where(TradingAccount.user_id == user_row.id))).scalar_one_or_none()
+    except Exception:
+        account = None
+    cross_line = _cross_buffer_line(account)
     text = (
         f"{TG_SIREN} <b>ПОДТВЕРЖДЕНИЕ СДЕЛКИ</b>\n\n"
         f"Пара: {symbol}\n"
         f"Направление: {side_tag} {side}\n"
-        f"Маржа (бюджет): {fmt_money(budget)}\n"
-        f"Плечо: {fmt_leverage(leverage)} | Объём: {fmt_money(notional)}\n\n"
+        f"Сумма входа (маржа): {fmt_money(budget)}\n"
+        f"Плечо: {fmt_leverage(leverage)} | Объём с плечом: {fmt_money(notional)}\n\n"
         f"{state_line}"
         f"{TG_STAR} TP: {fmt_price(tp) if tp else 'нет'}\n"
         f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(sl) if sl else 'нет'}\n"
+        f"{cross_line}"
         f"{_liquidation_lines(side, entry, leverage)}\n"
         "Исполнение — по серверной цене BingX в момент подтверждения."
     )
@@ -1074,6 +1104,10 @@ async def cb_confirm(callback: CallbackQuery, session):
         await session.commit()
         trade_state.pop(callback.from_user.id, None)
         side_tag = TG_LONG if position.side == "LONG" else TG_SHORT
+        # Свежий account для кросс-буфера после резерва маржи
+        await session.refresh(account)
+        from services.trading_account import refresh_account_stats as _refresh
+        await _refresh(session, account)
         liq_line = _liquidation_lines(
             format_side(position.side),
             position.entry_price,
@@ -1081,13 +1115,15 @@ async def cb_confirm(callback: CallbackQuery, session):
             position.quantity,
             position.notional,
         )
+        cross_line = _cross_buffer_line(account)
         await callback.message.edit_text(
             f"{TG_CHECK} <b>ПОЗИЦИЯ ОТКРЫТА</b>\n\n"
             f"{position.symbol} {side_tag} {format_side(position.side)} {fmt_leverage(position.leverage)}\n"
             f"Вход: {fmt_price(position.entry_price)}\n"
-            f"Маржа: {fmt_money(Decimal(state['budget']))} | Объём: {fmt_money(position.notional)}\n"
+            f"Сумма входа (маржа): {fmt_money(Decimal(state['budget']))} | Объём с плечом: {fmt_money(position.notional)}\n"
             f"{TG_STAR} TP: {fmt_price(position.take_profit) if position.take_profit else 'нет'}\n"
             f"{tg_emoji(RED_ID, '🔴')} SL: {fmt_price(position.stop_loss) if position.stop_loss else 'нет'}\n"
+            f"{cross_line}"
             f"{liq_line}\n"
             f"PnL обновляется в {TG_CHART} Мои сделки по живым ценам BingX.",
             parse_mode=ParseMode.HTML,
