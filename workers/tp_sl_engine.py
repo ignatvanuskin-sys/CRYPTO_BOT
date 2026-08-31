@@ -93,7 +93,7 @@ async def _process_page(session, positions, events: list[dict] | None = None) ->
             continue
         await refresh_account_stats(session, account)
 
-        # Liquidation check — 90% of margin lost (protects from negative return_amount).
+        # Liquidation check — 100% of margin lost (as on real exchange).
         # Threshold lives in services.pnl so the UI shows the very same price.
         if position.unrealized_pnl <= liquidation_threshold_pnl(
             position.notional, position.leverage

@@ -343,6 +343,10 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         side_str = format_side(p.side)
         side_tag = TG_LONG if side_str == "LONG" else TG_SHORT
         pnl_line = f"PnL: {fmt_money(p.unrealized_pnl)}"
+        # PnL% относительно маржи (profit-based)
+        pos_margin = (p.notional / p.leverage) if p.leverage else p.notional
+        pnl_pct = (p.unrealized_pnl / pos_margin * 100) if pos_margin else Decimal("0")
+        pnl_pct_str = fmt_pct(pnl_pct)
         status_line = f"{tg_emoji(GREEN_ID, '🟢')} ОТКРЫТА"
         liq = calc_liquidation_price(side_str, p.entry_price, p.leverage, p.quantity, p.notional)
         liq_line = (
@@ -354,8 +358,9 @@ async def _send_transactions(telegram_id: int, session, target: Message | Callba
         lines.append(
             f"{p.symbol} {side_tag} {side_str} {fmt_leverage(p.leverage)}\n"
             f"Вход: {fmt_price(p.entry_price)} → Сейчас: {fmt_price(p.current_price)}\n"
+            f"Объём: {fmt_money(p.notional)} | {pnl_line} ({pnl_pct_str})\n"
             f"{liq_line}"
-            f"{pnl_line} | {status_line}"
+            f"{status_line}"
         )
     # Callback («Обновить»/навигация) — редактируем окно на месте, не создавая новое сообщение
     if is_callback:

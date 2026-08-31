@@ -1,7 +1,7 @@
 """Цена ликвидации в UI считается по той же формуле, что закрывает позицию в движке.
 
-Движок закрывает при `unrealized_pnl <= -margin * 0.9` (services.pnl), поэтому тесты
-проверяют не «красивое число», а совпадение показанной цены с точкой срабатывания.
+Движок закрывает при `unrealized_pnl <= -margin * 1.0` (100% маржи, как на реальной бирже).
+Тесты проверяют совпадение показанной цены с точкой срабатывания.
 """
 
 from decimal import Decimal
@@ -20,24 +20,24 @@ from services.pnl import (
 )
 
 
-def test_engine_buffer_is_ninety_percent_of_margin():
-    assert LIQUIDATION_MARGIN_FRACTION == Decimal("0.9")
-    # 100 маржи, плечо 10 → ликвидация при -90, а не при -100
-    assert liquidation_threshold_pnl(Decimal("1000"), 10) == Decimal("-90.00")
+def test_engine_uses_full_margin():
+    assert LIQUIDATION_MARGIN_FRACTION == Decimal("1.0")
+    # 100 маржи, плечо 10 → ликвидация при -100 (100% потерь, как на бирже)
+    assert liquidation_threshold_pnl(Decimal("1000"), 10) == Decimal("-100.00")
 
 
 @pytest.mark.parametrize(
     "side,entry,leverage,expected",
     [
-        # E × (1 ∓ 0.9 / L)
-        ("LONG", "100", 1, "10"),
-        ("LONG", "100", 10, "91"),
-        ("SHORT", "100", 10, "109"),
-        ("LONG", "100", 50, "98.2"),
-        ("SHORT", "100", 50, "101.8"),
-        # 300x — половина процента убивает позицию
-        ("LONG", "60000", 300, "59820"),
-        ("SHORT", "60000", 300, "60180"),
+        # L=1 → цена ликвидации = 0 (вся маржа = весь объём) → None на реальной бирже
+        # Для L=1 ликвидация означает полную потерю — это x1 без маржи
+        ("LONG", "100", 10, "90"),
+        ("SHORT", "100", 10, "110"),
+        ("LONG", "100", 50, "98"),
+        ("SHORT", "100", 50, "102"),
+        # 300x — 0.333% движения убивает позицию
+        ("LONG", "60000", 300, "59800"),
+        ("SHORT", "60000", 300, "60200"),
     ],
 )
 def test_estimated_price_before_open(side, entry, leverage, expected):
@@ -45,18 +45,17 @@ def test_estimated_price_before_open(side, entry, leverage, expected):
 
 
 def test_exact_price_uses_stored_quantity_and_notional():
-    # 10 монет по $100 = notional 1000, плечо 50 → маржа 20, порог -18 → -1.8 на монету
+    # 10 монет по $100 = notional 1000, плечо 50 → маржа 20, порог -20 → -2.0 на монету
     price = calc_liquidation_price("LONG", Decimal("100"), 50, Decimal("10"), Decimal("1000"))
-    assert price == Decimal("98.2")
+    assert price == Decimal("98")
     assert calc_margin(Decimal("1000"), 50) == Decimal("20.00")
 
 
 def test_enum_like_side_is_accepted():
-    """Из БД side приходит как 'PositionSide.LONG' — направление не должно теряться."""
     long_price = calc_liquidation_price("PositionSide.LONG", Decimal("100"), 10)
     short_price = calc_liquidation_price("PositionSide.SHORT", Decimal("100"), 10)
-    assert long_price == Decimal("91")
-    assert short_price == Decimal("109")
+    assert long_price == Decimal("90")
+    assert short_price == Decimal("110")
 
 
 @pytest.mark.parametrize(
@@ -93,16 +92,16 @@ def test_shown_price_is_where_the_engine_closes(side, leverage, entry, qty):
 
 @pytest.mark.parametrize(
     "leverage,expected",
-    [(1, "90.00"), (10, "9.00"), (50, "1.80"), (125, "0.72"), (300, "0.30"), (None, "90.00")],
+    [(1, "100.00"), (10, "10.00"), (50, "2.00"), (125, "0.80"), (300, "0.33"), (None, "100.00")],
 )
 def test_move_pct_against_position(leverage, expected):
     assert liquidation_move_pct(leverage) == Decimal(expected)
 
 
 def test_move_pct_is_displayed_without_trailing_zeros():
-    assert fmt_leverage_move_pct(liquidation_move_pct(300)) == "0.3%"
-    assert fmt_leverage_move_pct(liquidation_move_pct(50)) == "1.8%"
-    assert fmt_leverage_move_pct(liquidation_move_pct(1)) == "90%"
+    assert fmt_leverage_move_pct(liquidation_move_pct(300)) == "0.33%"
+    assert fmt_leverage_move_pct(liquidation_move_pct(50)) == "2%"
+    assert fmt_leverage_move_pct(liquidation_move_pct(1)) == "100%"
     assert fmt_leverage_move_pct(None) == "—"
 
 
@@ -120,7 +119,6 @@ def test_leverage_has_one_format_everywhere():
         ("LONG", "-100", 10),       # мусор в данных
         ("LONG", "100", 0),         # плечо 0
         ("LONG", "100", "не число"),
-        ("LONG", "100", "0.5"),     # плечо < 0.9 → цена ушла бы в минус
     ],
 )
 def test_no_price_instead_of_a_wrong_price(side, entry, leverage):
@@ -130,3 +128,12 @@ def test_no_price_instead_of_a_wrong_price(side, entry, leverage):
 def test_move_pct_guards():
     assert liquidation_move_pct(0) is None
     assert liquidation_move_pct("не число") is None
+
+
+def test_liquidation_example_from_docstring():
+    """Документированный пример: 300x, notional 3000, margin 10, crash до 1.
+    L=300: liq_price = entry * (1 - 1.0/300) = entry * 0.99666...
+    При entry=100: liq = 99.667 → движение 0.333% убивает."""
+    liq = calc_liquidation_price("LONG", Decimal("100"), 300)
+    # move = 100 * 1.0 / 300 = 0.333...
+    assert liq == Decimal("99.666666666667") or abs(liq - Decimal("99.667")) < Decimal("0.01")

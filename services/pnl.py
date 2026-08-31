@@ -13,9 +13,10 @@ def calc_unrealized(side: str, entry: Decimal, current: Decimal, qty: Decimal) -
 def calc_notional(price: Decimal, qty: Decimal) -> Decimal:
     return (price * qty).quantize(Decimal("0.01"))
 
-# Ликвидация: буфер 10% — позиция закрывается до того, как убыток превысит маржу.
+# Ликвидация: полная потеря маржи (как на реальной бирже).
+# Позиция закрывается, когда убыток = 100% маржи.
 # Единственный источник правды и для tp_sl_engine, и для отображения в UI.
-LIQUIDATION_MARGIN_FRACTION = Decimal("0.9")
+LIQUIDATION_MARGIN_FRACTION = Decimal("1.0")
 
 
 def _safe_leverage(leverage: Decimal | int | None) -> Decimal | None:
@@ -59,11 +60,11 @@ def calc_liquidation_price(
     """Цена, при которой unrealized PnL достигает порога ликвидации.
 
     Обратная функция к проверке в tp_sl_engine:
-        LONG:  (P − E) × Q = −margin × 0.9
-        SHORT: (E − P) × Q = −margin × 0.9
+        LONG:  (P − E) × Q = −margin × 1.0
+        SHORT: (E − P) × Q = −margin × 1.0
 
     Если переданы quantity и notional (открытая позиция) — считаем от них,
-    ровно как движок. Иначе — оценка до открытия: E × (1 ∓ 0.9 / L).
+    ровно как движок. Иначе — оценка до открытия: E × (1 ∓ 1.0 / L).
     Возвращает None, если данных не хватает или цена ушла бы в ноль.
     """
     try:

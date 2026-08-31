@@ -305,11 +305,15 @@ async def _build_open_positions(telegram_id: int, session):
             if liq is not None
             else ""
         )
+        # PnL% относительно маржи (profit-based)
+        pos_margin = (p.notional / p.leverage) if p.leverage else p.notional
+        pnl_pct = (pnl / pos_margin * 100) if pos_margin else Decimal("0")
+        pnl_pct_str = fmt_pct(pnl_pct)
         lines.append(
-            f"{side_tag} <b>{p.symbol} {side_str} {fmt_leverage(p.leverage)} </b> {pnl_emoji} {pnl_str}\n"
+            f"{side_tag} <b>{p.symbol} {side_str} {fmt_leverage(p.leverage)} </b> {pnl_emoji} {pnl_str} ({pnl_pct_str})\n"
             f"Вход {fmt_price(p.entry_price)} → Сейчас {fmt_price(p.current_price)}\n"
+            f"Объём {fmt_money(p.notional)}\n"
             f"{liq_line}"
-            f"Объём {fmt_money(p.notional)}"
         )
         kb_rows.append([
             btn(f"Закрыть {p.symbol}", f"close_preview:{p.id}", icon=RED_ID, style="danger"),
